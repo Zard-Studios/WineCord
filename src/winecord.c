@@ -1666,6 +1666,14 @@ static bool prefix_matches_configured_prefix(const char *prefix, const char *con
            normalized_prefix[len] == '/';
 }
 
+static bool config_tracks_prefix(const Config *cfg, const char *prefix) {
+    if (!cfg || !prefix || !*prefix) return false;
+    for (int i = 0; i < cfg->bottle_count; i++) {
+        if (prefix_matches_configured_prefix(prefix, cfg->bottle_paths[i])) return true;
+    }
+    return false;
+}
+
 static bool heroic_runner_from_json(const char *path, const char *prefix, char *out, size_t out_len) {
     char *json = read_text_file_limited(path, 1024 * 1024);
     if (!json) return false;
@@ -1816,7 +1824,7 @@ static bool find_wine_runner(const Config *cfg, const char *prefix,
         override_wine,
         env_wine,
         "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
-        cfg ? cfg->wine_path : NULL,
+        (cfg && config_tracks_prefix(cfg, prefix)) ? cfg->wine_path : NULL,
         "/opt/homebrew/bin/wine64",
         "/opt/homebrew/bin/wine",
         "/usr/local/bin/wine64",
@@ -1918,6 +1926,23 @@ static int run_whisky_helper(const char *prefix, const char *whisky_path, const 
     return 0;
 }
 
+static bool prefix_path_to_windows_c(const char *prefix, const char *path, char *out, size_t out_len) {
+    if (!prefix || !path || !out || out_len == 0) return false;
+    out[0] = '\0';
+
+    char root[PATH_MAX];
+    if (snprintf(root, sizeof(root), "%s/drive_c/", prefix) >= (int)sizeof(root)) return false;
+    size_t root_len = strlen(root);
+    if (strncmp(path, root, root_len) != 0) return false;
+
+    const char *relative = path + root_len;
+    if (snprintf(out, out_len, "C:\\%s", relative) >= (int)out_len) return false;
+    for (char *p = out; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+    return true;
+}
+
 static int run_crossover_helper(const char *bottle, const char *wine,
                                 const char *helper_path, const char *helper_arg, bool quiet) {
     if (!path_exists(wine)) {
@@ -1939,7 +1964,11 @@ static int run_crossover_helper(const char *bottle, const char *wine,
     if (pid == 0) {
         setenv("CX_BOTTLE_PATH", bottle_parent, 1);
         if (is_crossover_cli_runner(wine)) {
-            execl(wine, "wine", "--bottle", bottle_name, "--no-gui", "--cx-app", helper_path, helper_arg, (char *)NULL);
+            char windows_path[PATH_MAX];
+            const char *cx_app = prefix_path_to_windows_c(bottle, helper_path, windows_path, sizeof(windows_path))
+                ? windows_path
+                : helper_path;
+            execl(wine, "wine", "--bottle", bottle_name, "--no-gui", "--cx-app", cx_app, helper_arg, (char *)NULL);
         } else {
             execl(wine, "wine", "--bottle", bottle_name, "--no-gui", helper_path, helper_arg, (char *)NULL);
         }
@@ -1952,8 +1981,12 @@ static int run_crossover_helper(const char *bottle, const char *wine,
         if (!quiet) {
             fprintf(stderr, "CrossOver command failed through bottle %s (status %d).\n", bottle_name, status);
             if (is_crossover_cli_runner(wine)) {
+                char windows_path[PATH_MAX];
+                const char *cx_app = prefix_path_to_windows_c(bottle, helper_path, windows_path, sizeof(windows_path))
+                    ? windows_path
+                    : helper_path;
                 fprintf(stderr, "Manual command:\n  CX_BOTTLE_PATH=\"%s\" \"%s\" --bottle \"%s\" --no-gui --cx-app \"%s\" %s\n",
-                        bottle_parent, wine, bottle_name, helper_path, helper_arg);
+                        bottle_parent, wine, bottle_name, cx_app, helper_arg);
             } else {
                 fprintf(stderr, "Manual command:\n  CX_BOTTLE_PATH=\"%s\" \"%s\" --bottle \"%s\" --no-gui \"%s\" %s\n",
                         bottle_parent, wine, bottle_name, helper_path, helper_arg);
@@ -2228,8 +2261,10 @@ static int remove_bottle_setup(const Config *cfg, const char *bottle, const char
     snprintf(helper_dest, sizeof(helper_dest), "%s/drive_c/windows/winecord-bridge.exe", bottle);
 
     char helper_runner[PATH_MAX] = "";
-    if (!find_helper(helper_runner, sizeof(helper_runner)) && path_exists(helper_dest)) {
+    if (path_exists(helper_dest)) {
         snprintf(helper_runner, sizeof(helper_runner), "%s", helper_dest);
+    } else if (!find_helper(helper_runner, sizeof(helper_runner))) {
+        helper_runner[0] = '\0';
     }
 
     if (helper_runner[0]) {
