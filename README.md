@@ -13,6 +13,14 @@ A tiny Discord Rich Presence bridge for Windows games running on macOS through W
 
 </div>
 
+## 🚀 Quick Setup
+
+```sh
+brew install zard-studios/tap/winecord
+winecord setup
+```
+
+
 ## 🚀 Setup & Documentation / Configurazione
 
 Select your language to start the setup guide / Seleziona la tua lingua per iniziare la guida all'installazione:
