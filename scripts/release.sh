@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="${1:-0.1.14}"
+VERSION="${1:-0.1.15}"
 make clean
 make VERSION="$VERSION" package
 

@@ -30,7 +30,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.14"
+#define WINECORD_VERSION "0.1.15"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -88,10 +88,13 @@ typedef struct {
 } FallbackContext;
 
 static pthread_mutex_t g_presence_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_rpc_connections = 0;
 static int g_real_rpc_sessions = 0;
 
 static void usage(FILE *out);
 static void *fallback_monitor_thread(void *arg);
+static void rpc_connection_started(void);
+static void rpc_connection_stopped(void);
 static void real_rpc_session_started(void);
 static void real_rpc_session_stopped(void);
 static bool real_rpc_active(void);
@@ -825,6 +828,18 @@ static int send_clear_activity(int discord_fd, const IpcSession *session) {
     return 0;
 }
 
+static void rpc_connection_started(void) {
+    pthread_mutex_lock(&g_presence_lock);
+    g_rpc_connections++;
+    pthread_mutex_unlock(&g_presence_lock);
+}
+
+static void rpc_connection_stopped(void) {
+    pthread_mutex_lock(&g_presence_lock);
+    if (g_rpc_connections > 0) g_rpc_connections--;
+    pthread_mutex_unlock(&g_presence_lock);
+}
+
 static void real_rpc_session_started(void) {
     pthread_mutex_lock(&g_presence_lock);
     g_real_rpc_sessions++;
@@ -839,7 +854,7 @@ static void real_rpc_session_stopped(void) {
 
 static bool real_rpc_active(void) {
     pthread_mutex_lock(&g_presence_lock);
-    bool active = g_real_rpc_sessions > 0;
+    bool active = g_rpc_connections > 0 || g_real_rpc_sessions > 0;
     pthread_mutex_unlock(&g_presence_lock);
     return active;
 }
@@ -929,11 +944,13 @@ static void *client_thread(void *arg) {
 
     fprintf(stdout, "Bridge client connected -> %s\n", discord_path);
     fflush(stdout);
+    rpc_connection_started();
     IpcSession session;
     memset(&session, 0, sizeof(session));
     bridge_loop(client_fd, discord_fd, &session, state_path);
     send_clear_activity(discord_fd, &session);
     if (session.saw_set_activity) real_rpc_session_stopped();
+    rpc_connection_stopped();
     close(discord_fd);
     close(client_fd);
     fprintf(stdout, "Bridge client disconnected\n");
