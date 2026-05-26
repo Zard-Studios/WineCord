@@ -1,108 +1,259 @@
 # WineCord
 
-WineCord is a tiny macOS bridge for Discord Rich Presence from Windows games
-running through Wine or CrossOver.
+Tiny Discord Rich Presence bridge for Windows games running on macOS through
+Wine or CrossOver.
 
-It is built as two small pieces:
+[![Homebrew tap](https://img.shields.io/badge/Homebrew-zard--studios%2Ftap-blue)](https://github.com/Zard-Studios/homebrew-tap)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-- `winecord`: a native macOS agent/CLI that listens only on `127.0.0.1`, finds
-  the local Discord IPC socket, and forwards bytes to Discord.
-- `winecord-bridge.exe`: a Windows helper that runs inside a Wine/CrossOver
-  bottle, creates `\\.\pipe\discord-ipc-0..9`, and forwards pipe traffic to the
-  macOS agent using a local token.
+WineCord is built to stay boring in the best way: no Electron, no Node runtime,
+no root daemon, no user-side build step. Install it, run setup, keep Discord for
+macOS open, then launch your Windows game from CrossOver.
 
-No Electron, no Node runtime, no background service with root privileges, and
-no build step for normal users.
+Languages / Lingue / Idiomas / Langues:
+[English](#english) | [Italiano](#italiano) | [Español](#español) | [Français](#français)
 
-## Install
+---
 
-The Homebrew package is prepared, but the public tap must exist before this
-command works. The tap repository must be:
+## English
 
-```text
-https://github.com/Zard-Studios/homebrew-tap
-```
-
-Once that repository exists and contains `Formula/winecord.rb`:
+### Install
 
 ```sh
 brew install zard-studios/tap/winecord
 winecord setup
 ```
 
-Later, if WineCord is accepted into Homebrew core, the install command becomes:
+That is the normal setup. `winecord setup` installs the macOS background agent,
+copies the Windows bridge into the detected CrossOver Steam bottle, writes the
+local config, and registers the Wine service.
 
-```sh
-brew install winecord
-winecord setup
-```
+After setup, leave Discord for macOS open and start the Windows game from
+CrossOver or Steam inside CrossOver.
 
-For a single command that installs through Homebrew and immediately configures
-the detected CrossOver Steam bottle after the tap is published:
+### If the bottle is not detected
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/Zard-Studios/WineCord/main/scripts/install.sh | sh
-```
-
-If your bottle is not auto-detected:
+Use this when your Steam bottle is in a custom location, or when you want to set
+up a different bottle:
 
 ```sh
 winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
 ```
 
-`winecord setup` installs the per-user LaunchAgent, starts the native macOS
-agent, copies the bundled `winecord-bridge.exe` into the CrossOver bottle,
-writes the shared token config, and registers the Wine service. Users do not
-need MinGW, Xcode, or any build tool.
-
-### Publishing The Tap
-
-Maintainers need to do this once:
-
-1. Create the GitHub repository `Zard-Studios/homebrew-tap`.
-2. Copy [Formula/winecord.rb](Formula/winecord.rb) into
-   `homebrew-tap/Formula/winecord.rb`.
-3. Publish a WineCord release with
-   `dist/winecord-0.1.4-macos-universal.tar.gz`.
-4. Verify:
+For multiple bottles, run the same command once per bottle:
 
 ```sh
-brew install zard-studios/tap/winecord
-winecord setup
+winecord setup --bottle "/path/to/CrossOver/Bottles/GameBottle"
 ```
 
-## Uninstall
+### Check or debug
+
+```sh
+winecord doctor
+winecord logs --follow
+```
+
+`winecord doctor` checks the local Discord socket, WineCord config, CrossOver
+detection, installed helper, and LaunchAgent path.
+
+`winecord logs --follow` shows live bridge activity. When a game really opens
+Discord IPC, you will see the pipe connection and the first IPC frame. If a game
+only uses Steam Rich Presence or Discord game detection, WineCord may have
+nothing to forward.
+
+### Uninstall
 
 ```sh
 winecord uninstall
 brew uninstall winecord
 ```
 
-`winecord uninstall` removes the LaunchAgent, the Wine service, the helper from
-the bottle, WineCord config, and WineCord logs. Use it before `brew uninstall`
-so the bottle is cleaned while the CLI is still available.
+Run `winecord uninstall` first so WineCord can remove the LaunchAgent, Wine
+service, helper, config, and logs while the CLI is still installed.
 
-## Commands
+---
 
-```sh
-winecord setup             # one-command local configuration
-winecord uninstall         # remove LaunchAgent, bottle helper, config, and logs
-winecord doctor            # show config, Discord IPC, and CrossOver diagnostics
-winecord logs --follow     # watch WineCord agent and bridge activity live
-winecord agent             # run the macOS forwarding agent in the foreground
-```
+## Italiano
 
-Advanced commands are still available for package managers and diagnostics:
+### Installazione
 
 ```sh
-winecord install-agent
-winecord uninstall-agent
-winecord start
-winecord stop
-winecord install-bottle --bottle PATH [--no-register]
+brew install zard-studios/tap/winecord
+winecord setup
 ```
 
-## Build From Source
+Questo è il setup normale. `winecord setup` installa l'agente macOS in
+background, copia il bridge Windows nella bottle Steam di CrossOver rilevata,
+scrive la configurazione locale e registra il servizio Wine.
+
+Dopo il setup, tieni aperto Discord per macOS e avvia il gioco Windows da
+CrossOver o da Steam dentro CrossOver.
+
+### Se la bottle non viene rilevata
+
+Usa questo comando quando la bottle Steam è in una posizione personalizzata, o
+quando vuoi configurare una bottle diversa:
+
+```sh
+winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
+```
+
+Per più bottle, esegui lo stesso comando una volta per ogni bottle:
+
+```sh
+winecord setup --bottle "/path/to/CrossOver/Bottles/GameBottle"
+```
+
+### Controllo e debug
+
+```sh
+winecord doctor
+winecord logs --follow
+```
+
+`winecord doctor` controlla il socket locale di Discord, la configurazione di
+WineCord, il rilevamento di CrossOver, l'helper installato e il percorso del
+LaunchAgent.
+
+`winecord logs --follow` mostra l'attività del bridge in tempo reale. Quando un
+gioco apre davvero Discord IPC, vedrai la connessione alla pipe e il primo frame
+IPC. Se un gioco usa solo Steam Rich Presence o il rilevamento gioco di Discord,
+WineCord potrebbe non avere nulla da inoltrare.
+
+### Disinstallazione
+
+```sh
+winecord uninstall
+brew uninstall winecord
+```
+
+Esegui prima `winecord uninstall`, così WineCord può rimuovere LaunchAgent,
+servizio Wine, helper, configurazione e log mentre la CLI è ancora installata.
+
+---
+
+## Español
+
+### Instalación
+
+```sh
+brew install zard-studios/tap/winecord
+winecord setup
+```
+
+Esta es la configuración normal. `winecord setup` instala el agente de macOS en
+segundo plano, copia el bridge de Windows en la botella Steam de CrossOver
+detectada, escribe la configuración local y registra el servicio de Wine.
+
+Después de la configuración, deja Discord para macOS abierto e inicia el juego
+de Windows desde CrossOver o desde Steam dentro de CrossOver.
+
+### Si no se detecta la botella
+
+Usa este comando si tu botella de Steam está en una ubicación personalizada, o
+si quieres configurar otra botella:
+
+```sh
+winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
+```
+
+Para varias botellas, ejecuta el mismo comando una vez por cada botella:
+
+```sh
+winecord setup --bottle "/path/to/CrossOver/Bottles/GameBottle"
+```
+
+### Comprobar o depurar
+
+```sh
+winecord doctor
+winecord logs --follow
+```
+
+`winecord doctor` comprueba el socket local de Discord, la configuración de
+WineCord, la detección de CrossOver, el helper instalado y la ruta del
+LaunchAgent.
+
+`winecord logs --follow` muestra la actividad del bridge en tiempo real. Cuando
+un juego abre realmente Discord IPC, verás la conexión a la pipe y el primer
+frame IPC. Si un juego solo usa Steam Rich Presence o la detección de juegos de
+Discord, puede que WineCord no tenga nada que reenviar.
+
+### Desinstalar
+
+```sh
+winecord uninstall
+brew uninstall winecord
+```
+
+Ejecuta primero `winecord uninstall` para que WineCord pueda eliminar el
+LaunchAgent, el servicio de Wine, el helper, la configuración y los logs mientras
+la CLI sigue instalada.
+
+---
+
+## Français
+
+### Installation
+
+```sh
+brew install zard-studios/tap/winecord
+winecord setup
+```
+
+C'est la configuration normale. `winecord setup` installe l'agent macOS en
+arrière-plan, copie le bridge Windows dans la bottle Steam de CrossOver détectée,
+écrit la configuration locale et enregistre le service Wine.
+
+Après la configuration, garde Discord pour macOS ouvert et lance le jeu Windows
+depuis CrossOver ou depuis Steam dans CrossOver.
+
+### Si la bottle n'est pas détectée
+
+Utilise cette commande si ta bottle Steam se trouve dans un emplacement
+personnalisé, ou si tu veux configurer une autre bottle:
+
+```sh
+winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
+```
+
+Pour plusieurs bottles, lance la même commande une fois par bottle:
+
+```sh
+winecord setup --bottle "/path/to/CrossOver/Bottles/GameBottle"
+```
+
+### Vérifier ou déboguer
+
+```sh
+winecord doctor
+winecord logs --follow
+```
+
+`winecord doctor` vérifie le socket local de Discord, la configuration WineCord,
+la détection de CrossOver, le helper installé et le chemin du LaunchAgent.
+
+`winecord logs --follow` affiche l'activité du bridge en direct. Quand un jeu
+ouvre vraiment Discord IPC, tu verras la connexion à la pipe et la première
+trame IPC. Si un jeu utilise seulement Steam Rich Presence ou la détection de
+jeu de Discord, WineCord peut ne rien avoir à transmettre.
+
+### Désinstallation
+
+```sh
+winecord uninstall
+brew uninstall winecord
+```
+
+Lance d'abord `winecord uninstall` pour que WineCord puisse supprimer le
+LaunchAgent, le service Wine, le helper, la configuration et les logs pendant
+que la CLI est encore installée.
+
+---
+
+## Notes For Maintainers
+
+Build and package:
 
 ```sh
 make
@@ -111,12 +262,19 @@ make package
 ```
 
 The release tarball contains a universal macOS binary and the Windows helper:
-`dist/winecord-0.1.4-macos-universal.tar.gz`.
 
-## Smoke Test
+```text
+dist/winecord-0.1.4-macos-universal.tar.gz
+```
 
-With Discord open, the LaunchAgent running, and the helper installed in the
-CrossOver bottle:
+Update the Homebrew tap after publishing a new package:
+
+```sh
+cp Formula/winecord.rb ../homebrew-tap/Formula/winecord.rb
+cp dist/winecord-*.tar.gz ../homebrew-tap/releases/
+```
+
+Useful local smoke test:
 
 ```sh
 make windows-smoke
@@ -129,39 +287,29 @@ The expected response for the bundled smoke test is Discord's `Invalid Client
 ID` close frame. That is good: it proves bytes traveled through the Windows
 named pipe, the Wine helper, the macOS agent, and Discord.
 
-Config lives in:
+## How It Works
+
+Discord IPC uses Windows named pipes on Windows and Unix domain sockets on
+macOS. Windows games usually look for `\\?\pipe\discord-ipc-{n}` or
+`\\.\pipe\discord-ipc-{n}`, while Discord for macOS exposes `discord-ipc-{n}`
+under the user's runtime/temp directories.
+
+WineCord keeps the bridge transport-level: it forwards bytes without rewriting
+Rich Presence payloads. That keeps it small and compatible with games that
+already speak Discord IPC correctly.
+
+Config:
 
 ```text
 ~/Library/Application Support/WineCord/config.ini
 ```
 
-Logs live in:
+Logs:
 
 ```text
 ~/Library/Logs/WineCord/
-```
-
-The Windows bridge log also lives inside the bottle:
-
-```text
 drive_c/users/Public/WineCord/bridge.log
 ```
-
-When a Windows game really opens Discord IPC, `winecord logs --follow` shows the
-pipe connection and the first IPC frame. That makes it clear whether WineCord is
-receiving Discord RPC traffic or the game is only using Steam/game activity
-detection.
-
-## Design Notes
-
-Discord's documented IPC transport uses Windows named pipes on Windows and Unix
-domain sockets on Linux/macOS. Wine games usually look for
-`\\?\pipe\discord-ipc-{n}` or `\\.\pipe\discord-ipc-{n}`, while Discord for
-macOS exposes `discord-ipc-{n}` under the user's runtime/temp directories.
-
-WineCord keeps the bridge transport-level: it forwards bytes without parsing or
-rewriting Rich Presence payloads. That makes it small and keeps it compatible
-with old and future games that already speak Discord IPC correctly.
 
 References:
 
