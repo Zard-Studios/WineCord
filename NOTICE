@@ -1,0 +1,7 @@
+WineCord
+Created by Zard Studios.
+Copyright (c) 2026 Zard Studios.
+
+WineCord forwards Discord Rich Presence IPC bytes from Windows games running
+under Wine/CrossOver to the native Discord client on macOS. It does not modify
+or spoof game payloads.
