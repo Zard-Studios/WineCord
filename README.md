@@ -16,12 +16,21 @@ no build step for normal users.
 
 ## Install
 
+The Homebrew package is prepared, but the public tap must exist before this
+command works. The tap repository must be:
+
+```text
+https://github.com/Zard-Studios/homebrew-tap
+```
+
+Once that repository exists and contains `Formula/winecord.rb`:
+
 ```sh
 brew install zard-studios/tap/winecord
 winecord setup
 ```
 
-When WineCord is accepted into Homebrew core, the install command becomes:
+Later, if WineCord is accepted into Homebrew core, the install command becomes:
 
 ```sh
 brew install winecord
@@ -29,7 +38,7 @@ winecord setup
 ```
 
 For a single command that installs through Homebrew and immediately configures
-the detected CrossOver Steam bottle:
+the detected CrossOver Steam bottle after the tap is published:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Zard-Studios/WineCord/main/scripts/install.sh | sh
@@ -45,6 +54,22 @@ winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
 agent, copies the bundled `winecord-bridge.exe` into the CrossOver bottle,
 writes the shared token config, and registers the Wine service. Users do not
 need MinGW, Xcode, or any build tool.
+
+### Publishing The Tap
+
+Maintainers need to do this once:
+
+1. Create the GitHub repository `Zard-Studios/homebrew-tap`.
+2. Copy [Formula/winecord.rb](Formula/winecord.rb) into
+   `homebrew-tap/Formula/winecord.rb`.
+3. Publish a WineCord release with
+   `dist/winecord-0.1.0-macos-universal.tar.gz`.
+4. Verify:
+
+```sh
+brew install zard-studios/tap/winecord
+winecord setup
+```
 
 ## Uninstall
 
