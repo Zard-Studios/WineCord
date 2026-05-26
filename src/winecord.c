@@ -29,7 +29,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.10"
+#define WINECORD_VERSION "0.1.11"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
