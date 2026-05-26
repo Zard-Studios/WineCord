@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define WINECORD_VERSION "0.1.15"
+#define WINECORD_VERSION "0.1.16"
 #define SERVICE_NAME "WineCordBridge"
 #define CONFIG_PATH "C:\\users\\Public\\WineCord\\config.ini"
 #define LOG_PATH "C:\\users\\Public\\WineCord\\bridge.log"

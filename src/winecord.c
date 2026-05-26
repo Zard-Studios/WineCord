@@ -30,7 +30,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.15"
+#define WINECORD_VERSION "0.1.16"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -42,6 +42,7 @@
 #define WINECORD_FALLBACK_POLL_SECONDS 5
 #define WINECORD_FALLBACK_GRACE_SECONDS 15
 #define WINECORD_FALLBACK_REFRESH_SECONDS 60
+#define WINECORD_RPC_SUPPRESS_SECONDS 90
 #define WINECORD_UPDATE_CHECK_INTERVAL 86400
 #define WINECORD_FORMULA_URL "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/Formula/winecord.rb"
 
@@ -90,6 +91,7 @@ typedef struct {
 static pthread_mutex_t g_presence_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_rpc_connections = 0;
 static int g_real_rpc_sessions = 0;
+static time_t g_last_rpc_seen = 0;
 
 static void usage(FILE *out);
 static void *fallback_monitor_thread(void *arg);
@@ -831,18 +833,21 @@ static int send_clear_activity(int discord_fd, const IpcSession *session) {
 static void rpc_connection_started(void) {
     pthread_mutex_lock(&g_presence_lock);
     g_rpc_connections++;
+    g_last_rpc_seen = time(NULL);
     pthread_mutex_unlock(&g_presence_lock);
 }
 
 static void rpc_connection_stopped(void) {
     pthread_mutex_lock(&g_presence_lock);
     if (g_rpc_connections > 0) g_rpc_connections--;
+    g_last_rpc_seen = time(NULL);
     pthread_mutex_unlock(&g_presence_lock);
 }
 
 static void real_rpc_session_started(void) {
     pthread_mutex_lock(&g_presence_lock);
     g_real_rpc_sessions++;
+    g_last_rpc_seen = time(NULL);
     pthread_mutex_unlock(&g_presence_lock);
 }
 
@@ -854,7 +859,9 @@ static void real_rpc_session_stopped(void) {
 
 static bool real_rpc_active(void) {
     pthread_mutex_lock(&g_presence_lock);
-    bool active = g_rpc_connections > 0 || g_real_rpc_sessions > 0;
+    time_t now = time(NULL);
+    bool recently_seen = g_last_rpc_seen > 0 && now - g_last_rpc_seen < WINECORD_RPC_SUPPRESS_SECONDS;
+    bool active = g_rpc_connections > 0 || g_real_rpc_sessions > 0 || recently_seen;
     pthread_mutex_unlock(&g_presence_lock);
     return active;
 }
