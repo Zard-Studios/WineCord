@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define WINECORD_VERSION "0.1.4"
+#define WINECORD_VERSION "0.1.5"
 #define SERVICE_NAME "WineCordBridge"
 #define CONFIG_PATH "C:\\users\\Public\\WineCord\\config.ini"
 #define LOG_PATH "C:\\users\\Public\\WineCord\\bridge.log"
@@ -571,7 +571,13 @@ static int remove_service(void) {
     }
     SC_HANDLE svc = OpenServiceA(scm, SERVICE_NAME, SERVICE_STOP | DELETE);
     if (!svc) {
-        fprintf(stderr, "OpenService failed: %lu\n", GetLastError());
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST) {
+            CloseServiceHandle(scm);
+            printf("%s service is not installed.\n", SERVICE_NAME);
+            return 0;
+        }
+        fprintf(stderr, "OpenService failed: %lu\n", err);
         CloseServiceHandle(scm);
         return 1;
     }

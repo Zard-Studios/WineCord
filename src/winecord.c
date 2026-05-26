@@ -28,12 +28,13 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.4"
+#define WINECORD_VERSION "0.1.5"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
 #define WINECORD_TOKEN_BYTES 32
 #define MAX_CANDIDATES 64
+#define MAX_TRACKED_BOTTLES 16
 
 typedef struct {
     char app_dir[PATH_MAX];
@@ -42,12 +43,23 @@ typedef struct {
     char host[64];
     int port;
     char token[(WINECORD_TOKEN_BYTES * 2) + 1];
+    char bottle_paths[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int bottle_count;
 } Config;
 
 typedef struct {
     int client_fd;
     char token[(WINECORD_TOKEN_BYTES * 2) + 1];
+    char state_path[PATH_MAX];
 } ClientContext;
+
+typedef struct {
+    char client_id[80];
+    long pid;
+    bool saw_set_activity;
+    unsigned char pending[32768];
+    size_t pending_len;
+} IpcSession;
 
 static void usage(FILE *out);
 
@@ -167,6 +179,51 @@ static void default_config(Config *cfg) {
     cfg->port = WINECORD_DEFAULT_PORT;
 }
 
+static void normalize_path_copy(char *out, size_t out_len, const char *path) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (!path || !*path) return;
+
+    if (snprintf(out, out_len, "%s", path) >= (int)out_len) {
+        out[out_len - 1] = '\0';
+    }
+    size_t len = strlen(out);
+    while (len > 1 && out[len - 1] == '/') out[--len] = '\0';
+}
+
+static void remember_bottle(Config *cfg, const char *path) {
+    if (!cfg || !path || !*path) return;
+
+    char normalized[PATH_MAX];
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved)) normalize_path_copy(normalized, sizeof(normalized), resolved);
+    else normalize_path_copy(normalized, sizeof(normalized), path);
+    if (!normalized[0]) return;
+
+    for (int i = 0; i < cfg->bottle_count; i++) {
+        if (strcmp(cfg->bottle_paths[i], normalized) == 0) return;
+    }
+    if (cfg->bottle_count >= MAX_TRACKED_BOTTLES) return;
+    snprintf(cfg->bottle_paths[cfg->bottle_count++], PATH_MAX, "%s", normalized);
+}
+
+static bool add_path_target(char paths[][PATH_MAX], int *count, const char *path) {
+    if (!paths || !count || !path || !*path || *count >= MAX_TRACKED_BOTTLES) return false;
+
+    char normalized[PATH_MAX];
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved)) normalize_path_copy(normalized, sizeof(normalized), resolved);
+    else normalize_path_copy(normalized, sizeof(normalized), path);
+    if (!normalized[0]) return false;
+
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(paths[i], normalized) == 0) return false;
+    }
+    snprintf(paths[*count], PATH_MAX, "%s", normalized);
+    (*count)++;
+    return true;
+}
+
 static int generate_token(char *out, size_t out_len) {
     if (out_len < (WINECORD_TOKEN_BYTES * 2) + 1) return -1;
 
@@ -211,6 +268,9 @@ static int save_config(const Config *cfg) {
     fprintf(f, "host=%s\n", cfg->host);
     fprintf(f, "port=%d\n", cfg->port);
     fprintf(f, "token=%s\n", cfg->token);
+    for (int i = 0; i < cfg->bottle_count; i++) {
+        fprintf(f, "bottle=%s\n", cfg->bottle_paths[i]);
+    }
     fclose(f);
     chmod(cfg->config_path, 0600);
     return 0;
@@ -244,6 +304,8 @@ static int load_config(Config *cfg) {
             cfg->port = atoi(value);
         } else if (strcmp(key, "token") == 0 && *value) {
             snprintf(cfg->token, sizeof(cfg->token), "%s", value);
+        } else if (strcmp(key, "bottle") == 0 && *value) {
+            remember_bottle(cfg, value);
         }
     }
     fclose(f);
@@ -269,6 +331,10 @@ static void token_redacted(const Config *cfg, char *out, size_t out_len) {
         return;
     }
     snprintf(out, out_len, "%.6s...%.6s", cfg->token, cfg->token + len - 6);
+}
+
+static void state_path_for_config(const Config *cfg, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s/state.ini", cfg->app_dir);
 }
 
 static bool add_candidate(char paths[][PATH_MAX], int *count, const char *path) {
@@ -388,6 +454,13 @@ static uint32_t read_le32(const unsigned char *p) {
            ((uint32_t)p[3] << 24);
 }
 
+static void write_le32(unsigned char *p, uint32_t value) {
+    p[0] = (unsigned char)(value & 0xff);
+    p[1] = (unsigned char)((value >> 8) & 0xff);
+    p[2] = (unsigned char)((value >> 16) & 0xff);
+    p[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
 static void extract_json_string(const unsigned char *payload, size_t payload_len,
                                 const char *key, char *out, size_t out_len) {
     out[0] = '\0';
@@ -404,7 +477,7 @@ static void extract_json_string(const unsigned char *payload, size_t payload_len
         while (j < payload_len && payload[j] != ':') j++;
         if (j >= payload_len) return;
         j++;
-        while (j < payload_len && isspace(payload[j])) j++;
+        while (j < payload_len && isspace((unsigned char)payload[j])) j++;
         if (j >= payload_len || payload[j] != '"') return;
         j++;
 
@@ -416,6 +489,162 @@ static void extract_json_string(const unsigned char *payload, size_t payload_len
         }
         out[pos] = '\0';
         return;
+    }
+}
+
+static bool extract_json_long(const unsigned char *payload, size_t payload_len,
+                              const char *key, long *out) {
+    if (!payload || !key || !out) return false;
+
+    char needle[96];
+    if (snprintf(needle, sizeof(needle), "\"%s\"", key) >= (int)sizeof(needle)) return false;
+    size_t needle_len = strlen(needle);
+
+    for (size_t i = 0; i + needle_len < payload_len; i++) {
+        if (memcmp(payload + i, needle, needle_len) != 0) continue;
+
+        size_t j = i + needle_len;
+        while (j < payload_len && payload[j] != ':') j++;
+        if (j >= payload_len) return false;
+        j++;
+        while (j < payload_len && isspace((unsigned char)payload[j])) j++;
+        if (j >= payload_len) return false;
+
+        char num[32];
+        size_t pos = 0;
+        if (payload[j] == '-') num[pos++] = (char)payload[j++];
+        while (j < payload_len && isdigit((unsigned char)payload[j]) && pos + 1 < sizeof(num)) {
+            num[pos++] = (char)payload[j++];
+        }
+        if (pos == 0 || (pos == 1 && num[0] == '-')) return false;
+        num[pos] = '\0';
+        *out = strtol(num, NULL, 10);
+        return true;
+    }
+    return false;
+}
+
+static int write_ipc_frame(int fd, uint32_t opcode, const char *json) {
+    size_t len = strlen(json);
+    if (len > UINT32_MAX) return -1;
+
+    unsigned char header[8];
+    write_le32(header, opcode);
+    write_le32(header + 4, (uint32_t)len);
+    if (write_all(fd, header, sizeof(header)) < 0) return -1;
+    return write_all(fd, json, len) < 0 ? -1 : 0;
+}
+
+static int read_full_timeout(int fd, unsigned char *buf, size_t len, int timeout_ms) {
+    size_t total = 0;
+    while (total < len) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) return -1;
+        ssize_t n = read(fd, buf + total, len - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        total += (size_t)n;
+    }
+    return 0;
+}
+
+static int read_ipc_frame_timeout(int fd, uint32_t *opcode, char *payload,
+                                  size_t payload_len, int timeout_ms) {
+    unsigned char header[8];
+    if (read_full_timeout(fd, header, sizeof(header), timeout_ms) != 0) return -1;
+    uint32_t op = read_le32(header);
+    uint32_t len = read_le32(header + 4);
+
+    size_t keep = len;
+    if (payload && payload_len > 0 && keep >= payload_len) keep = payload_len - 1;
+    if (keep > 0 && read_full_timeout(fd, (unsigned char *)payload, keep, timeout_ms) != 0) return -1;
+    if (payload && payload_len > 0) payload[keep] = '\0';
+
+    unsigned char discard[512];
+    uint32_t remaining = len > keep ? len - (uint32_t)keep : 0;
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+        if (read_full_timeout(fd, discard, chunk, timeout_ms) != 0) return -1;
+        remaining -= (uint32_t)chunk;
+    }
+
+    if (opcode) *opcode = op;
+    return 0;
+}
+
+static void save_activity_state(const char *state_path, const IpcSession *session) {
+    if (!state_path || !*state_path || !session || !session->client_id[0]) return;
+
+    char parent[PATH_MAX];
+    if (parent_dir(state_path, parent, sizeof(parent)) != 0 || mkdir_p(parent, 0700) != 0) return;
+
+    FILE *f = fopen(state_path, "w");
+    if (!f) return;
+    fprintf(f, "client_id=%s\n", session->client_id);
+    fprintf(f, "pid=%ld\n", session->pid > 0 ? session->pid : (long)getpid());
+    fprintf(f, "updated=%ld\n", (long)time(NULL));
+    fclose(f);
+    chmod(state_path, 0600);
+}
+
+static void inspect_client_ipc_frame(uint32_t opcode, const unsigned char *payload,
+                                     size_t payload_len, IpcSession *session,
+                                     const char *state_path) {
+    if (opcode == 0) {
+        char client_id[sizeof(session->client_id)];
+        extract_json_string(payload, payload_len, "client_id", client_id, sizeof(client_id));
+        if (client_id[0]) snprintf(session->client_id, sizeof(session->client_id), "%s", client_id);
+    } else if (opcode == 1) {
+        char command[80];
+        extract_json_string(payload, payload_len, "cmd", command, sizeof(command));
+        if (strcmp(command, "SET_ACTIVITY") == 0) {
+            long pid = 0;
+            if (extract_json_long(payload, payload_len, "pid", &pid) && pid > 0) {
+                session->pid = pid;
+            }
+            session->saw_set_activity = true;
+            save_activity_state(state_path, session);
+        }
+    }
+}
+
+static void inspect_client_ipc_frames(const unsigned char *buf, ssize_t n,
+                                      IpcSession *session, const char *state_path) {
+    if (!buf || n <= 0 || !session) return;
+
+    size_t incoming = (size_t)n;
+    if (incoming > sizeof(session->pending) ||
+        session->pending_len > sizeof(session->pending) - incoming) {
+        session->pending_len = 0;
+        if (incoming > sizeof(session->pending)) return;
+    }
+    memcpy(session->pending + session->pending_len, buf, incoming);
+    session->pending_len += incoming;
+
+    size_t pos = 0;
+    while (pos + 8 <= session->pending_len) {
+        uint32_t opcode = read_le32(session->pending + pos);
+        uint32_t declared_len = read_le32(session->pending + pos + 4);
+        if (declared_len > sizeof(session->pending) - 8) {
+            session->pending_len = 0;
+            return;
+        }
+
+        size_t frame_len = 8 + (size_t)declared_len;
+        if (frame_len > session->pending_len - pos) break;
+        inspect_client_ipc_frame(opcode, session->pending + pos + 8,
+                                 declared_len, session, state_path);
+        pos += frame_len;
+    }
+
+    if (pos > 0) {
+        session->pending_len -= pos;
+        memmove(session->pending, session->pending + pos, session->pending_len);
     }
 }
 
@@ -446,7 +675,27 @@ static void log_ipc_frame(const char *direction, const unsigned char *buf, ssize
     fflush(stdout);
 }
 
-static int bridge_loop(int a, int b) {
+static int send_clear_activity(int discord_fd, const IpcSession *session) {
+    if (!session || !session->client_id[0] || !session->saw_set_activity) return 0;
+
+    long pid = session->pid > 0 ? session->pid : (long)getpid();
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%ld,\"activity\":null},"
+             "\"nonce\":\"winecord-clear-%ld\"}",
+             pid, (long)time(NULL));
+
+    if (write_ipc_frame(discord_fd, 1, json) != 0) {
+        fprintf(stderr, "Could not clear Discord activity for client_id=%s\n", session->client_id);
+        return -1;
+    }
+    fprintf(stdout, "Cleared Discord activity for client_id=%s pid=%ld\n", session->client_id, pid);
+    fflush(stdout);
+    usleep(100000);
+    return 0;
+}
+
+static int bridge_loop(int a, int b, IpcSession *session, const char *state_path) {
     unsigned char buf[16384];
     struct pollfd fds[2];
     bool logged_client_frame = false;
@@ -468,6 +717,7 @@ static int bridge_loop(int a, int b) {
                 ssize_t n = read(from, buf, sizeof(buf));
                 if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) return 0;
+                if (from == a) inspect_client_ipc_frames(buf, n, session, state_path);
                 if (from == a && !logged_client_frame) {
                     log_ipc_frame("Client -> Discord", buf, n);
                     logged_client_frame = true;
@@ -502,6 +752,8 @@ static void *client_thread(void *arg) {
     int client_fd = ctx->client_fd;
     char expected[(WINECORD_TOKEN_BYTES * 2) + 1];
     snprintf(expected, sizeof(expected), "%s", ctx->token);
+    char state_path[PATH_MAX];
+    snprintf(state_path, sizeof(state_path), "%s", ctx->state_path);
     free(ctx);
 
     char preamble[256];
@@ -528,7 +780,10 @@ static void *client_thread(void *arg) {
 
     fprintf(stdout, "Bridge client connected -> %s\n", discord_path);
     fflush(stdout);
-    bridge_loop(client_fd, discord_fd);
+    IpcSession session;
+    memset(&session, 0, sizeof(session));
+    bridge_loop(client_fd, discord_fd, &session, state_path);
+    send_clear_activity(discord_fd, &session);
     close(discord_fd);
     close(client_fd);
     fprintf(stdout, "Bridge client disconnected\n");
@@ -591,6 +846,7 @@ static int run_agent(const Config *cfg) {
         }
         ctx->client_fd = client_fd;
         snprintf(ctx->token, sizeof(ctx->token), "%s", cfg->token);
+        state_path_for_config(cfg, ctx->state_path, sizeof(ctx->state_path));
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, ctx) != 0) {
@@ -668,6 +924,27 @@ static void discover_steam_bottle(char *out, size_t out_len) {
     if (is_directory(base)) snprintf(out, out_len, "%s", base);
 }
 
+static void resolve_bottle(const Config *cfg, char *out, size_t out_len) {
+    out[0] = '\0';
+
+    const char *env = getenv("WINECORD_BOTTLE");
+    if (env && *env && is_directory(env)) {
+        normalize_path_copy(out, out_len, env);
+        return;
+    }
+
+    if (cfg) {
+        for (int i = 0; i < cfg->bottle_count; i++) {
+            if (is_directory(cfg->bottle_paths[i])) {
+                normalize_path_copy(out, out_len, cfg->bottle_paths[i]);
+                return;
+            }
+        }
+    }
+
+    discover_steam_bottle(out, out_len);
+}
+
 static int doctor(const Config *cfg) {
     char token[80];
     token_redacted(cfg, token, sizeof(token));
@@ -677,14 +954,24 @@ static int doctor(const Config *cfg) {
     printf("  path:  %s\n", cfg->config_path);
     printf("  agent: %s:%d\n", cfg->host, cfg->port);
     printf("  token: %s\n", token);
+    char state_path[PATH_MAX];
+    state_path_for_config(cfg, state_path, sizeof(state_path));
+    printf("  state: %s\n", state_path);
     printf("\n");
     print_discord_sockets();
 
     char bottle[PATH_MAX];
-    discover_steam_bottle(bottle, sizeof(bottle));
+    resolve_bottle(cfg, bottle, sizeof(bottle));
     printf("\nCrossOver:\n");
     printf("  app:    %s\n", is_directory("/Applications/CrossOver.app") ? "/Applications/CrossOver.app" : "not found");
     printf("  bottle: %s\n", bottle[0] ? bottle : "not found; pass --bottle PATH");
+    if (cfg->bottle_count > 0) {
+        printf("  known bottles:\n");
+        for (int i = 0; i < cfg->bottle_count; i++) {
+            printf("    %s (%s)\n", cfg->bottle_paths[i],
+                   is_directory(cfg->bottle_paths[i]) ? "available" : "missing");
+        }
+    }
 
     if (bottle[0]) {
         char helper[PATH_MAX];
@@ -763,7 +1050,7 @@ static int show_logs(const Config *cfg, int argc, char **argv) {
 
     char discovered[PATH_MAX];
     if (!bottle) {
-        discover_steam_bottle(discovered, sizeof(discovered));
+        resolve_bottle(cfg, discovered, sizeof(discovered));
         bottle = discovered[0] ? discovered : NULL;
     }
 
@@ -794,6 +1081,128 @@ static int show_logs(const Config *cfg, int argc, char **argv) {
     }
     int rc = system(cmd);
     return rc == 0 ? 0 : 1;
+}
+
+static bool load_activity_state(const char *state_path, char *client_id,
+                                size_t client_id_len, long *pid) {
+    if (client_id && client_id_len > 0) client_id[0] = '\0';
+    if (pid) *pid = 0;
+    FILE *f = fopen(state_path, "r");
+    if (!f) return false;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        chomp(line);
+        char *p = trim(line);
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = trim(p);
+        char *value = trim(eq + 1);
+        if (strcmp(key, "client_id") == 0 && client_id && client_id_len > 0) {
+            snprintf(client_id, client_id_len, "%s", value);
+        } else if (strcmp(key, "pid") == 0 && pid) {
+            *pid = strtol(value, NULL, 10);
+        }
+    }
+    fclose(f);
+    return client_id && client_id[0];
+}
+
+static bool parse_last_client_id_from_log(const Config *cfg, char *client_id, size_t client_id_len) {
+    if (!client_id || client_id_len == 0) return false;
+    client_id[0] = '\0';
+
+    char log_path[PATH_MAX];
+    snprintf(log_path, sizeof(log_path), "%s/agent.log", cfg->log_dir);
+    FILE *f = fopen(log_path, "r");
+    if (!f) return false;
+
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = strstr(line, "client_id=");
+        if (!p) continue;
+        p += strlen("client_id=");
+        size_t pos = 0;
+        while (isdigit((unsigned char)p[pos]) && pos + 1 < client_id_len) {
+            client_id[pos] = p[pos];
+            pos++;
+        }
+        client_id[pos] = '\0';
+    }
+    fclose(f);
+    return client_id[0] != '\0';
+}
+
+static int clear_activity_for_client(const char *client_id, long pid) {
+    if (!client_id || !*client_id) {
+        fprintf(stderr, "No Discord client_id available to clear.\n");
+        return 1;
+    }
+    if (pid <= 0) pid = (long)getpid();
+
+    char discord_path[PATH_MAX];
+    int fd = connect_discord(discord_path, sizeof(discord_path));
+    if (fd < 0) {
+        fprintf(stderr, "Could not connect to Discord IPC socket. Is Discord open?\n");
+        return 1;
+    }
+
+    char json[512];
+    snprintf(json, sizeof(json), "{\"v\":1,\"client_id\":\"%s\"}", client_id);
+    if (write_ipc_frame(fd, 0, json) != 0) {
+        fprintf(stderr, "Could not send Discord handshake.\n");
+        close(fd);
+        return 1;
+    }
+
+    uint32_t opcode = 0;
+    char response[4096];
+    if (read_ipc_frame_timeout(fd, &opcode, response, sizeof(response), 2500) != 0 || opcode == 2) {
+        fprintf(stderr, "Discord rejected or did not answer the handshake for client_id=%s.\n", client_id);
+        close(fd);
+        return 1;
+    }
+
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%ld,\"activity\":null},"
+             "\"nonce\":\"winecord-clear-%ld\"}",
+             pid, (long)time(NULL));
+    if (write_ipc_frame(fd, 1, json) != 0) {
+        fprintf(stderr, "Could not send clear activity request.\n");
+        close(fd);
+        return 1;
+    }
+
+    read_ipc_frame_timeout(fd, &opcode, response, sizeof(response), 1000);
+    close(fd);
+    printf("Cleared Discord activity for client_id=%s pid=%ld\n", client_id, pid);
+    return 0;
+}
+
+static int clear_activity_command(const Config *cfg, int argc, char **argv) {
+    char client_id[80] = "";
+    long pid = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--client-id") == 0 && i + 1 < argc) {
+            snprintf(client_id, sizeof(client_id), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+            pid = strtol(argv[++i], NULL, 10);
+        } else {
+            fprintf(stderr, "Unknown clear option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    if (!client_id[0]) {
+        char state_path[PATH_MAX];
+        state_path_for_config(cfg, state_path, sizeof(state_path));
+        load_activity_state(state_path, client_id, sizeof(client_id), &pid);
+    }
+    if (!client_id[0]) parse_last_client_id_from_log(cfg, client_id, sizeof(client_id));
+
+    return clear_activity_for_client(client_id, pid);
 }
 
 static int install_agent(const Config *cfg) {
@@ -870,8 +1279,23 @@ static int uninstall_agent(void) {
     return 0;
 }
 
-static int start_agent(void) {
-    char cmd[512];
+static int start_agent(const Config *cfg) {
+    char plist[PATH_MAX];
+    snprintf(plist, sizeof(plist), "%s/Library/LaunchAgents/%s.plist", home_dir(), WINECORD_LABEL);
+    if (!path_exists(plist)) return install_agent(cfg);
+
+    char cmd[(PATH_MAX * 2) + 128];
+    snprintf(cmd, sizeof(cmd), "launchctl print gui/%d/%s >/dev/null 2>&1", getuid(), WINECORD_LABEL);
+    if (system(cmd) != 0) {
+        char qplist[PATH_MAX + 8];
+        if (shell_quote(plist, qplist, sizeof(qplist)) != 0) return 1;
+        snprintf(cmd, sizeof(cmd), "launchctl bootstrap gui/%d %s", getuid(), qplist);
+        if (system(cmd) != 0) {
+            fprintf(stderr, "Could not load LaunchAgent. Run `winecord setup` to repair it.\n");
+            return 1;
+        }
+    }
+
     snprintf(cmd, sizeof(cmd), "launchctl kickstart -k gui/%d/%s", getuid(), WINECORD_LABEL);
     int rc = system(cmd);
     return rc == 0 ? 0 : 1;
@@ -1062,7 +1486,7 @@ static int register_windows_service(const char *bottle, const char *helper_dest)
     return 0;
 }
 
-static int install_bottle(const Config *cfg, int argc, char **argv) {
+static int install_bottle(Config *cfg, int argc, char **argv) {
     const char *bottle = NULL;
     const char *helper = NULL;
     bool no_register = false;
@@ -1110,6 +1534,9 @@ static int install_bottle(const Config *cfg, int argc, char **argv) {
         return 1;
     }
 
+    remember_bottle(cfg, bottle);
+    if (save_config(cfg) != 0) return 1;
+
     if (write_bottle_config(cfg, bottle) != 0) return 1;
 
     char helper_dest[PATH_MAX];
@@ -1122,47 +1549,68 @@ static int install_bottle(const Config *cfg, int argc, char **argv) {
     return 0;
 }
 
-static void remove_file_if_exists(const char *path) {
+static bool remove_file_if_exists(const char *path) {
     if (unlink(path) == 0) {
         printf("Removed: %s\n", path);
+        return true;
     } else if (errno != ENOENT) {
         fprintf(stderr, "Could not remove %s: %s\n", path, strerror(errno));
+        return false;
     }
+    return true;
+}
+
+static bool remove_dir_if_empty(const char *path) {
+    if (rmdir(path) == 0) {
+        printf("Removed: %s\n", path);
+        return true;
+    }
+    if (errno == ENOENT) return true;
+    fprintf(stderr, "Could not remove %s: %s\n", path, strerror(errno));
+    return false;
 }
 
 static int remove_bottle_setup(const char *bottle) {
-    char discovered[PATH_MAX];
-    if (!bottle) {
-        discover_steam_bottle(discovered, sizeof(discovered));
-        bottle = discovered[0] ? discovered : NULL;
-    }
-    if (!bottle || !is_directory(bottle)) {
-        printf("No CrossOver bottle found; skipped bottle cleanup.\n");
-        return 0;
-    }
+    if (!bottle || !is_directory(bottle)) return 1;
+    int failures = 0;
 
     char helper_dest[PATH_MAX];
     snprintf(helper_dest, sizeof(helper_dest), "%s/drive_c/windows/winecord-bridge.exe", bottle);
-    if (path_exists(helper_dest)) {
-        run_crossover_helper(bottle, helper_dest, "--remove", true);
-        remove_file_if_exists(helper_dest);
+
+    char helper_runner[PATH_MAX] = "";
+    if (!find_helper(helper_runner, sizeof(helper_runner)) && path_exists(helper_dest)) {
+        snprintf(helper_runner, sizeof(helper_runner), "%s", helper_dest);
+    }
+
+    if (helper_runner[0]) {
+        if (run_crossover_helper(bottle, helper_runner, "--remove", false) != 0) {
+            fprintf(stderr, "Could not remove the WineCordBridge service from bottle: %s\n", bottle);
+            failures++;
+        }
+    } else {
+        fprintf(stderr, "Could not find winecord-bridge.exe to remove the Wine service in bottle: %s\n", bottle);
+        failures++;
+    }
+
+    if (path_exists(helper_dest) && !remove_file_if_exists(helper_dest)) {
+        failures++;
     }
 
     char file[PATH_MAX];
     snprintf(file, sizeof(file), "%s/drive_c/users/Public/WineCord/config.ini", bottle);
-    remove_file_if_exists(file);
+    if (!remove_file_if_exists(file)) failures++;
     snprintf(file, sizeof(file), "%s/drive_c/users/Public/WineCord/bridge.log", bottle);
-    remove_file_if_exists(file);
+    if (!remove_file_if_exists(file)) failures++;
 
     char dir[PATH_MAX];
     snprintf(dir, sizeof(dir), "%s/drive_c/users/Public/WineCord", bottle);
-    if (rmdir(dir) == 0) printf("Removed: %s\n", dir);
+    if (!remove_dir_if_empty(dir)) failures++;
 
-    printf("Cleaned bottle: %s\n", bottle);
-    return 0;
+    if (failures == 0) printf("Cleaned bottle: %s\n", bottle);
+    return failures == 0 ? 0 : 1;
 }
 
-static int setup_all(const Config *cfg, int argc, char **argv) {
+static int setup_all(Config *cfg, int argc, char **argv) {
     printf("Setting up WineCord...\n");
     fflush(stdout);
     if (install_agent(cfg) != 0) return 1;
@@ -1172,14 +1620,15 @@ static int setup_all(const Config *cfg, int argc, char **argv) {
 }
 
 static int uninstall_all(const Config *cfg, int argc, char **argv) {
-    const char *bottle = NULL;
+    char bottle_targets[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int bottle_target_count = 0;
     bool keep_config = false;
     bool keep_logs = false;
     bool skip_bottle = false;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--bottle") == 0 && i + 1 < argc) {
-            bottle = argv[++i];
+            add_path_target(bottle_targets, &bottle_target_count, argv[++i]);
         } else if (strcmp(argv[i], "--keep-config") == 0) {
             keep_config = true;
         } else if (strcmp(argv[i], "--keep-logs") == 0) {
@@ -1194,12 +1643,54 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
 
     printf("Uninstalling WineCord setup...\n");
     fflush(stdout);
-    if (!skip_bottle) remove_bottle_setup(bottle);
+
+    int bottle_failures = 0;
+    if (!skip_bottle) {
+        if (bottle_target_count == 0) {
+            for (int i = 0; i < cfg->bottle_count; i++) {
+                add_path_target(bottle_targets, &bottle_target_count, cfg->bottle_paths[i]);
+            }
+
+            char discovered[PATH_MAX];
+            discover_steam_bottle(discovered, sizeof(discovered));
+            if (discovered[0]) add_path_target(bottle_targets, &bottle_target_count, discovered);
+        }
+
+        if (bottle_target_count == 0) {
+            printf("No CrossOver bottle recorded or discovered; skipped bottle cleanup.\n");
+        }
+
+        for (int i = 0; i < bottle_target_count; i++) {
+            const char *target = bottle_targets[i];
+            if (!is_directory(target)) {
+                fprintf(stderr,
+                        "Could not access the configured CrossOver bottle:\n"
+                        "  %s\n"
+                        "If this bottle is on an external volume, connect that volume and run `winecord uninstall` again.\n",
+                        target);
+                bottle_failures++;
+                continue;
+            }
+            if (remove_bottle_setup(target) != 0) bottle_failures++;
+        }
+    }
+
     uninstall_agent();
 
+    if (bottle_failures > 0) {
+        keep_config = true;
+        keep_logs = true;
+        fprintf(stderr,
+                "\nWineCord uninstall is incomplete. Kept local config and logs so the remaining bottle cleanup can be retried.\n"
+                "Reconnect any external volume that contains a CrossOver bottle, then run `winecord uninstall` again.\n");
+    }
+
     if (!keep_config) {
+        char state_path[PATH_MAX];
+        state_path_for_config(cfg, state_path, sizeof(state_path));
+        remove_file_if_exists(state_path);
         remove_file_if_exists(cfg->config_path);
-        if (rmdir(cfg->app_dir) == 0) printf("Removed: %s\n", cfg->app_dir);
+        remove_dir_if_empty(cfg->app_dir);
     }
 
     if (!keep_logs) {
@@ -1208,8 +1699,10 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
         remove_file_if_exists(path);
         snprintf(path, sizeof(path), "%s/agent.err.log", cfg->log_dir);
         remove_file_if_exists(path);
-        if (rmdir(cfg->log_dir) == 0) printf("Removed: %s\n", cfg->log_dir);
+        remove_dir_if_empty(cfg->log_dir);
     }
+
+    if (bottle_failures > 0) return 1;
 
     printf("\nWineCord setup removed. You can now run `brew uninstall winecord` to remove the package.\n");
     return 0;
@@ -1221,9 +1714,10 @@ static void usage(FILE *out) {
             "Created by Zard Studios. Copyright (c) 2026 Zard Studios.\n\n"
             "Usage:\n"
             "  winecord setup [--bottle PATH] [--helper PATH] [--no-register]\n"
-            "  winecord uninstall [--bottle PATH] [--keep-config] [--keep-logs]\n"
+            "  winecord uninstall [--bottle PATH] [--keep-config] [--keep-logs] [--no-bottle]\n"
             "  winecord agent\n"
             "  winecord doctor\n"
+            "  winecord clear [--client-id ID] [--pid PID]\n"
             "  winecord logs [--follow] [--bottle PATH]\n"
             "  winecord install-agent\n"
             "  winecord uninstall-agent\n"
@@ -1253,10 +1747,11 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "uninstall") == 0) return uninstall_all(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "agent") == 0) return run_agent(&cfg);
     if (strcmp(cmd, "doctor") == 0) return doctor(&cfg);
+    if (strcmp(cmd, "clear") == 0) return clear_activity_command(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "logs") == 0) return show_logs(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "install-agent") == 0) return install_agent(&cfg);
     if (strcmp(cmd, "uninstall-agent") == 0) return uninstall_agent();
-    if (strcmp(cmd, "start") == 0) return start_agent();
+    if (strcmp(cmd, "start") == 0) return start_agent(&cfg);
     if (strcmp(cmd, "stop") == 0) return stop_agent();
     if (strcmp(cmd, "install-bottle") == 0) return install_bottle(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "help") == 0) {

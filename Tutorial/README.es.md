@@ -46,6 +46,14 @@ un juego abre Discord IPC, verás la conexión a la pipe y el primer frame IPC. 
 un juego solo usa Steam Rich Presence o la detección de juegos de Discord, puede
 que WineCord no tenga nada que reenviar.
 
+Si Discord sigue mostrando un juego después de cerrarlo, ejecuta:
+
+```sh
+winecord clear
+```
+
+Esto le pide a Discord que borre la última actividad que vio WineCord.
+
 ## 🧹 Desinstalar
 
 ```sh
@@ -56,6 +64,11 @@ brew uninstall winecord
 Ejecuta primero `winecord uninstall` para que WineCord pueda eliminar el
 LaunchAgent, el servicio de Wine, el helper, la configuración y los logs mientras
 la CLI sigue instalada.
+
+Si tu botella de CrossOver está en una unidad externa, conecta esa unidad antes
+de desinstalar. Cuando WineCord no puede acceder a una botella que configuró
+antes, conserva la configuración y los logs locales, te avisa y te pide ejecutar
+`winecord uninstall` otra vez después de montar la unidad.
 
 ## 🛠 Notas para mantenedores
 

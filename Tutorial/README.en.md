@@ -45,6 +45,14 @@ IPC, you will see the pipe connection and the first IPC frame. If a game only
 uses Steam Rich Presence or Discord game detection, WineCord may have nothing to
 forward.
 
+If Discord keeps showing a game after it has closed, run:
+
+```sh
+winecord clear
+```
+
+This asks Discord to clear the last activity WineCord saw.
+
 ## 🧹 Uninstall
 
 ```sh
@@ -54,6 +62,11 @@ brew uninstall winecord
 
 Run `winecord uninstall` first so WineCord can remove the LaunchAgent, Wine
 service, helper, configuration, and logs while the CLI is still installed.
+
+If your CrossOver bottle is on an external drive, connect that drive before
+uninstalling. When WineCord cannot access a bottle it previously configured, it
+keeps the local config and logs, warns you, and asks you to run `winecord
+uninstall` again after the drive is mounted.
 
 ## 🛠 Maintainer notes
 
