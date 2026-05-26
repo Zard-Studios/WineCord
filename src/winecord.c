@@ -29,14 +29,17 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.11"
+#define WINECORD_VERSION "0.1.12"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
+#define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
 #define WINECORD_TOKEN_BYTES 32
 #define MAX_CANDIDATES 64
 #define MAX_TRACKED_BOTTLES 16
 #define MAX_STEAM_ACTIVITY 32
+#define WINECORD_FALLBACK_POLL_SECONDS 5
+#define WINECORD_FALLBACK_REFRESH_SECONDS 60
 #define WINECORD_UPDATE_CHECK_INTERVAL 86400
 #define WINECORD_FORMULA_URL "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/Formula/winecord.rb"
 
@@ -71,7 +74,25 @@ typedef struct {
     int process_count;
 } SteamActivityCounter;
 
+typedef struct {
+    char appid[32];
+    char name[256];
+    char prefix[PATH_MAX];
+    int process_count;
+} SteamActivity;
+
+typedef struct {
+    Config cfg;
+} FallbackContext;
+
+static pthread_mutex_t g_presence_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_real_rpc_sessions = 0;
+
 static void usage(FILE *out);
+static void *fallback_monitor_thread(void *arg);
+static void real_rpc_session_started(void);
+static void real_rpc_session_stopped(void);
+static bool real_rpc_active(void);
 static bool find_whisky_runner(const char *prefix, char *whisky_path, size_t whisky_len,
                                char *bottle_name, size_t name_len);
 static bool find_wine_runner(const Config *cfg, const char *prefix,
@@ -611,6 +632,36 @@ static int write_ipc_frame(int fd, uint32_t opcode, const char *json) {
     return write_all(fd, json, len) < 0 ? -1 : 0;
 }
 
+static void json_escape_string(const char *in, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (!in) return;
+
+    size_t pos = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && pos + 1 < out_len; p++) {
+        if (*p == '"' || *p == '\\') {
+            if (pos + 2 >= out_len) break;
+            out[pos++] = '\\';
+            out[pos++] = (char)*p;
+        } else if (*p == '\n') {
+            if (pos + 2 >= out_len) break;
+            out[pos++] = '\\';
+            out[pos++] = 'n';
+        } else if (*p == '\r') {
+            if (pos + 2 >= out_len) break;
+            out[pos++] = '\\';
+            out[pos++] = 'r';
+        } else if (*p == '\t') {
+            if (pos + 2 >= out_len) break;
+            out[pos++] = '\\';
+            out[pos++] = 't';
+        } else if (*p >= 32) {
+            out[pos++] = (char)*p;
+        }
+    }
+    out[pos] = '\0';
+}
+
 static int read_full_timeout(int fd, unsigned char *buf, size_t len, int timeout_ms) {
     size_t total = 0;
     while (total < len) {
@@ -683,6 +734,7 @@ static void inspect_client_ipc_frame(uint32_t opcode, const unsigned char *paylo
             if (extract_json_long(payload, payload_len, "pid", &pid) && pid > 0) {
                 session->pid = pid;
             }
+            if (!session->saw_set_activity) real_rpc_session_started();
             session->saw_set_activity = true;
             save_activity_state(state_path, session);
         }
@@ -769,6 +821,25 @@ static int send_clear_activity(int discord_fd, const IpcSession *session) {
     fflush(stdout);
     usleep(100000);
     return 0;
+}
+
+static void real_rpc_session_started(void) {
+    pthread_mutex_lock(&g_presence_lock);
+    g_real_rpc_sessions++;
+    pthread_mutex_unlock(&g_presence_lock);
+}
+
+static void real_rpc_session_stopped(void) {
+    pthread_mutex_lock(&g_presence_lock);
+    if (g_real_rpc_sessions > 0) g_real_rpc_sessions--;
+    pthread_mutex_unlock(&g_presence_lock);
+}
+
+static bool real_rpc_active(void) {
+    pthread_mutex_lock(&g_presence_lock);
+    bool active = g_real_rpc_sessions > 0;
+    pthread_mutex_unlock(&g_presence_lock);
+    return active;
 }
 
 static int bridge_loop(int a, int b, IpcSession *session, const char *state_path) {
@@ -860,6 +931,7 @@ static void *client_thread(void *arg) {
     memset(&session, 0, sizeof(session));
     bridge_loop(client_fd, discord_fd, &session, state_path);
     send_clear_activity(discord_fd, &session);
+    if (session.saw_set_activity) real_rpc_session_stopped();
     close(discord_fd);
     close(client_fd);
     fprintf(stdout, "Bridge client disconnected\n");
@@ -906,6 +978,18 @@ static int run_agent(const Config *cfg) {
 
     fprintf(stdout, "WineCord agent listening on %s:%d\n", cfg->host, cfg->port);
     fflush(stdout);
+
+    FallbackContext *fallback = calloc(1, sizeof(*fallback));
+    if (fallback) {
+        fallback->cfg = *cfg;
+        pthread_t fallback_tid;
+        if (pthread_create(&fallback_tid, NULL, fallback_monitor_thread, fallback) == 0) {
+            pthread_detach(fallback_tid);
+        } else {
+            fprintf(stderr, "Could not start Steam fallback monitor.\n");
+            free(fallback);
+        }
+    }
 
     for (;;) {
         int client_fd = accept(listen_fd, NULL, NULL);
@@ -1312,6 +1396,176 @@ static int steam_activity_command(const Config *cfg) {
     printf("WineCord Steam activity detector\n");
     print_steam_activity_for_prefixes(prefixes, prefix_count);
     return 0;
+}
+
+static bool find_active_steam_game(const Config *cfg, SteamActivity *out) {
+    if (!cfg || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    char prefixes[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int prefix_count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
+    for (int i = 0; i < prefix_count; i++) {
+        SteamActivityCounter games[MAX_STEAM_ACTIVITY];
+        memset(games, 0, sizeof(games));
+        bool saw_log = false;
+        int game_count = collect_steam_activity_for_prefix(prefixes[i], games,
+                                                          MAX_STEAM_ACTIVITY, &saw_log);
+        if (!saw_log) continue;
+
+        char steam_root[PATH_MAX] = "";
+        steam_root_for_prefix(prefixes[i], steam_root, sizeof(steam_root));
+        for (int j = 0; j < game_count; j++) {
+            if (games[j].process_count <= 0) continue;
+            snprintf(out->appid, sizeof(out->appid), "%s", games[j].appid);
+            snprintf(out->prefix, sizeof(out->prefix), "%s", prefixes[i]);
+            out->process_count = games[j].process_count;
+            if (!steam_app_name(steam_root, games[j].appid, out->name, sizeof(out->name))) {
+                snprintf(out->name, sizeof(out->name), "Steam app %s", games[j].appid);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static int open_fallback_discord(void) {
+    char discord_path[PATH_MAX];
+    int fd = connect_discord(discord_path, sizeof(discord_path));
+    if (fd < 0) return -1;
+
+    char json[256];
+    snprintf(json, sizeof(json), "{\"v\":1,\"client_id\":\"%s\"}", WINECORD_FALLBACK_CLIENT_ID);
+    if (write_ipc_frame(fd, 0, json) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    uint32_t opcode = 0;
+    char response[4096];
+    if (read_ipc_frame_timeout(fd, &opcode, response, sizeof(response), 2500) != 0 || opcode == 2) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int send_fallback_clear(int fd) {
+    if (fd < 0) return -1;
+
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%ld,\"activity\":null},"
+             "\"nonce\":\"winecord-fallback-clear-%ld\"}",
+             (long)getpid(), (long)time(NULL));
+    if (write_ipc_frame(fd, 1, json) != 0) return -1;
+
+    uint32_t opcode = 0;
+    char response[4096];
+    read_ipc_frame_timeout(fd, &opcode, response, sizeof(response), 1000);
+    return 0;
+}
+
+static int send_fallback_activity(int fd, const SteamActivity *game, time_t started_at) {
+    if (fd < 0 || !game || !game->appid[0]) return -1;
+
+    char name_json[512];
+    json_escape_string(game->name[0] ? game->name : "Steam game", name_json, sizeof(name_json));
+
+    char image_url[256];
+    snprintf(image_url, sizeof(image_url),
+             "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/header.jpg",
+             game->appid);
+
+    char json[2048];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%ld,\"activity\":{"
+             "\"details\":\"%s\","
+             "\"state\":\"Steam game through Wine\","
+             "\"timestamps\":{\"start\":%ld},"
+             "\"assets\":{\"large_image\":\"%s\",\"large_text\":\"%s\"}"
+             "}},\"nonce\":\"winecord-fallback-%s-%ld\"}",
+             (long)getpid(),
+             name_json,
+             (long)started_at,
+             image_url,
+             name_json,
+             game->appid,
+             (long)time(NULL));
+
+    if (write_ipc_frame(fd, 1, json) != 0) return -1;
+
+    uint32_t opcode = 0;
+    char response[4096];
+    if (read_ipc_frame_timeout(fd, &opcode, response, sizeof(response), 2500) != 0 || opcode == 2) {
+        return -1;
+    }
+    return 0;
+}
+
+static void *fallback_monitor_thread(void *arg) {
+    FallbackContext *ctx = (FallbackContext *)arg;
+    Config cfg = ctx->cfg;
+    free(ctx);
+
+    int discord_fd = -1;
+    char active_appid[32] = "";
+    char active_name[256] = "";
+    time_t started_at = 0;
+    time_t last_sent = 0;
+
+    for (;;) {
+        SteamActivity game;
+        bool has_game = !real_rpc_active() && find_active_steam_game(&cfg, &game);
+
+        if (!has_game) {
+            if (discord_fd >= 0) {
+                send_fallback_clear(discord_fd);
+                close(discord_fd);
+                discord_fd = -1;
+                if (active_appid[0]) {
+                    fprintf(stdout, "Steam fallback cleared for %s\n", active_name[0] ? active_name : active_appid);
+                    fflush(stdout);
+                }
+            }
+            active_appid[0] = '\0';
+            active_name[0] = '\0';
+            started_at = 0;
+            last_sent = 0;
+            sleep(WINECORD_FALLBACK_POLL_SECONDS);
+            continue;
+        }
+
+        bool changed = strcmp(active_appid, game.appid) != 0;
+        if (changed) {
+            if (discord_fd >= 0) {
+                send_fallback_clear(discord_fd);
+                close(discord_fd);
+                discord_fd = -1;
+            }
+            snprintf(active_appid, sizeof(active_appid), "%s", game.appid);
+            snprintf(active_name, sizeof(active_name), "%s", game.name);
+            started_at = time(NULL);
+            last_sent = 0;
+        }
+
+        if (discord_fd < 0) discord_fd = open_fallback_discord();
+        time_t now = time(NULL);
+        if (discord_fd >= 0 &&
+            (changed || last_sent == 0 || now - last_sent >= WINECORD_FALLBACK_REFRESH_SECONDS)) {
+            if (send_fallback_activity(discord_fd, &game, started_at) == 0) {
+                last_sent = now;
+                if (changed) {
+                    fprintf(stdout, "Steam fallback activity: %s (AppID %s)\n", game.name, game.appid);
+                    fflush(stdout);
+                }
+            } else {
+                close(discord_fd);
+                discord_fd = -1;
+            }
+        }
+
+        sleep(WINECORD_FALLBACK_POLL_SECONDS);
+    }
 }
 
 static int doctor(const Config *cfg) {
