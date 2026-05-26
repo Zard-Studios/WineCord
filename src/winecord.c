@@ -2130,9 +2130,13 @@ static int install_one_prefix(Config *cfg, const char *prefix, const char *helpe
             has_runner = find_whisky_runner(prefix, whisky_path, sizeof(whisky_path), whisky_name, sizeof(whisky_name));
         }
         if (!has_runner) {
-            fprintf(stderr, "Skipping prefix without a usable Wine runner: %s\n", prefix);
-            fprintf(stderr, "Pass --wine /path/to/wine if this prefix uses a custom runner.\n");
-            return 1;
+            if (required) {
+                fprintf(stderr, "No usable Wine runner found for prefix: %s\n", prefix);
+                fprintf(stderr, "Pass --wine /path/to/wine if this prefix uses a custom runner.\n");
+                return 1;
+            }
+            printf("Skipped prefix without a usable Wine runner: %s\n", prefix);
+            return 2;
         }
     }
 
@@ -2214,11 +2218,15 @@ static int install_bottle(Config *cfg, int argc, char **argv) {
     }
 
     int installed = 0;
+    int skipped = 0;
     int failed = 0;
     for (int i = 0; i < prefix_count; i++) {
         printf("\nConfiguring Wine prefix: %s\n", prefixes[i]);
-        if (install_one_prefix(cfg, prefixes[i], helper, wine, no_register, explicit_prefix[0] != '\0') == 0) {
+        int result = install_one_prefix(cfg, prefixes[i], helper, wine, no_register, explicit_prefix[0] != '\0');
+        if (result == 0) {
             installed++;
+        } else if (result == 2) {
+            skipped++;
         } else {
             failed++;
             if (explicit_prefix[0]) return 1;
@@ -2226,6 +2234,10 @@ static int install_bottle(Config *cfg, int argc, char **argv) {
     }
 
     if (installed == 0) return 1;
+    if (skipped > 0) {
+        printf("\nWineCord configured %d prefix(es) and skipped %d prefix(es) without a usable runner.\n",
+               installed, skipped);
+    }
     if (failed > 0) {
         fprintf(stderr, "\nWineCord configured %d prefix(es), but skipped %d prefix(es) with errors.\n", installed, failed);
     }
