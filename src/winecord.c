@@ -135,6 +135,27 @@ static int current_executable(char *out, size_t out_len) {
     return 0;
 }
 
+static void launch_executable(char *out, size_t out_len) {
+    if (current_executable(out, out_len) != 0) {
+        snprintf(out, out_len, "winecord");
+        return;
+    }
+
+    const char marker[] = "/Cellar/winecord/";
+    char *cellar = strstr(out, marker);
+    if (!cellar) return;
+
+    char prefix[PATH_MAX];
+    size_t prefix_len = (size_t)(cellar - out);
+    if (prefix_len == 0 || prefix_len >= sizeof(prefix)) return;
+    memcpy(prefix, out, prefix_len);
+    prefix[prefix_len] = '\0';
+
+    char stable[PATH_MAX];
+    if (snprintf(stable, sizeof(stable), "%s/opt/winecord/bin/winecord", prefix) >= (int)sizeof(stable)) return;
+    if (path_exists(stable)) snprintf(out, out_len, "%s", stable);
+}
+
 static void default_config(Config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     snprintf(cfg->app_dir, sizeof(cfg->app_dir),
@@ -623,10 +644,7 @@ static int shell_quote(const char *in, char *out, size_t out_len) {
 
 static int install_agent(const Config *cfg) {
     char exe[PATH_MAX];
-    if (current_executable(exe, sizeof(exe)) != 0) {
-        fprintf(stderr, "Could not resolve current executable path\n");
-        return 1;
-    }
+    launch_executable(exe, sizeof(exe));
 
     char agents_dir[PATH_MAX];
     snprintf(agents_dir, sizeof(agents_dir), "%s/Library/LaunchAgents", home_dir());
@@ -778,11 +796,38 @@ static bool find_helper(char *out, size_t out_len) {
     if (current_executable(exe, sizeof(exe)) == 0) {
         char dir[PATH_MAX];
         parent_dir(exe, dir, sizeof(dir));
-        char candidate[PATH_MAX];
-        snprintf(candidate, sizeof(candidate), "%s/winecord-bridge.exe", dir);
-        if (path_exists(candidate)) {
-            snprintf(out, out_len, "%s", candidate);
-            return true;
+        const char *relative[] = {
+            "%s/winecord-bridge.exe",
+            "%s/../libexec/winecord/winecord-bridge.exe",
+            "%s/../share/winecord/winecord-bridge.exe",
+            NULL
+        };
+        for (int i = 0; relative[i]; i++) {
+            char candidate[PATH_MAX];
+            if (snprintf(candidate, sizeof(candidate), relative[i], dir) >= (int)sizeof(candidate)) continue;
+            char resolved[PATH_MAX];
+            const char *check = realpath(candidate, resolved) ? resolved : candidate;
+            if (path_exists(check)) {
+                snprintf(out, out_len, "%s", check);
+                return true;
+            }
+        }
+
+        const char marker[] = "/Cellar/winecord/";
+        char *cellar = strstr(exe, marker);
+        if (cellar) {
+            char prefix[PATH_MAX];
+            size_t prefix_len = (size_t)(cellar - exe);
+            if (prefix_len > 0 && prefix_len < sizeof(prefix)) {
+                memcpy(prefix, exe, prefix_len);
+                prefix[prefix_len] = '\0';
+                char candidate[PATH_MAX];
+                snprintf(candidate, sizeof(candidate), "%s/opt/winecord/libexec/winecord/winecord-bridge.exe", prefix);
+                if (path_exists(candidate)) {
+                    snprintf(out, out_len, "%s", candidate);
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -791,6 +836,43 @@ static bool find_helper(char *out, size_t out_len) {
 static const char *base_name(const char *path) {
     const char *slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
+}
+
+static int run_crossover_helper(const char *bottle, const char *helper_path, const char *helper_arg, bool quiet) {
+    const char *wine = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine";
+    if (!path_exists(wine)) {
+        if (!quiet) printf("CrossOver wine wrapper not found: %s\n", wine);
+        return quiet ? 0 : 1;
+    }
+
+    const char *bottle_name = base_name(bottle);
+    char bottle_parent[PATH_MAX];
+    parent_dir(bottle, bottle_parent, sizeof(bottle_parent));
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork failed: %s\n", strerror(errno));
+        return 1;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    if (pid == 0) {
+        setenv("CX_BOTTLE_PATH", bottle_parent, 1);
+        execl(wine, "wine", "--bottle", bottle_name, "--no-gui", helper_path, helper_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (!quiet) {
+            fprintf(stderr, "CrossOver command failed through bottle %s (status %d).\n", bottle_name, status);
+            fprintf(stderr, "Manual command:\n  CX_BOTTLE_PATH=\"%s\" \"%s\" --bottle \"%s\" --no-gui \"%s\" %s\n",
+                    bottle_parent, wine, bottle_name, helper_path, helper_arg);
+        }
+        return 1;
+    }
+    return 0;
 }
 
 static int write_bottle_config(const Config *cfg, const char *bottle) {
@@ -816,37 +898,8 @@ static int write_bottle_config(const Config *cfg, const char *bottle) {
 }
 
 static int register_windows_service(const char *bottle, const char *helper_dest) {
-    const char *wine = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine";
-    if (!path_exists(wine)) {
-        printf("CrossOver wine wrapper not found; run the helper with --install manually.\n");
-        return 0;
-    }
-
-    const char *bottle_name = base_name(bottle);
-    char bottle_parent[PATH_MAX];
-    parent_dir(bottle, bottle_parent, sizeof(bottle_parent));
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        fprintf(stderr, "fork failed: %s\n", strerror(errno));
-        return 1;
-    }
-    if (pid == 0) {
-        setenv("CX_BOTTLE_PATH", bottle_parent, 1);
-        execl(wine, "wine", "--bottle", bottle_name, "--no-gui", helper_dest, "--install", (char *)NULL);
-        _exit(127);
-    }
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        fprintf(stderr, "Service registration failed through CrossOver (status %d).\n", status);
-        fprintf(stderr, "Manual command:\n  \"%s\" --bottle \"%s\" --no-gui \"%s\" --install\n",
-                wine, bottle_name, helper_dest);
-        fprintf(stderr, "With external bottle dirs, prefix it with:\n  CX_BOTTLE_PATH=\"%s\"\n", bottle_parent);
-        return 1;
-    }
-    printf("Registered WineCordBridge service in bottle: %s\n", bottle_name);
+    if (run_crossover_helper(bottle, helper_dest, "--install", false) != 0) return 1;
+    printf("Registered WineCordBridge service in bottle: %s\n", base_name(bottle));
     return 0;
 }
 
@@ -910,11 +963,106 @@ static int install_bottle(const Config *cfg, int argc, char **argv) {
     return 0;
 }
 
+static void remove_file_if_exists(const char *path) {
+    if (unlink(path) == 0) {
+        printf("Removed: %s\n", path);
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "Could not remove %s: %s\n", path, strerror(errno));
+    }
+}
+
+static int remove_bottle_setup(const char *bottle) {
+    char discovered[PATH_MAX];
+    if (!bottle) {
+        discover_steam_bottle(discovered, sizeof(discovered));
+        bottle = discovered[0] ? discovered : NULL;
+    }
+    if (!bottle || !is_directory(bottle)) {
+        printf("No CrossOver bottle found; skipped bottle cleanup.\n");
+        return 0;
+    }
+
+    char helper_dest[PATH_MAX];
+    snprintf(helper_dest, sizeof(helper_dest), "%s/drive_c/windows/winecord-bridge.exe", bottle);
+    if (path_exists(helper_dest)) {
+        run_crossover_helper(bottle, helper_dest, "--remove", true);
+        remove_file_if_exists(helper_dest);
+    }
+
+    char file[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/drive_c/users/Public/WineCord/config.ini", bottle);
+    remove_file_if_exists(file);
+    snprintf(file, sizeof(file), "%s/drive_c/users/Public/WineCord/bridge.log", bottle);
+    remove_file_if_exists(file);
+
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/drive_c/users/Public/WineCord", bottle);
+    if (rmdir(dir) == 0) printf("Removed: %s\n", dir);
+
+    printf("Cleaned bottle: %s\n", bottle);
+    return 0;
+}
+
+static int setup_all(const Config *cfg, int argc, char **argv) {
+    printf("Setting up WineCord...\n");
+    fflush(stdout);
+    if (install_agent(cfg) != 0) return 1;
+    if (install_bottle(cfg, argc, argv) != 0) return 1;
+    printf("\nDone. Keep Discord for macOS open, then launch the Windows game from CrossOver.\n");
+    return 0;
+}
+
+static int uninstall_all(const Config *cfg, int argc, char **argv) {
+    const char *bottle = NULL;
+    bool keep_config = false;
+    bool keep_logs = false;
+    bool skip_bottle = false;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--bottle") == 0 && i + 1 < argc) {
+            bottle = argv[++i];
+        } else if (strcmp(argv[i], "--keep-config") == 0) {
+            keep_config = true;
+        } else if (strcmp(argv[i], "--keep-logs") == 0) {
+            keep_logs = true;
+        } else if (strcmp(argv[i], "--no-bottle") == 0) {
+            skip_bottle = true;
+        } else {
+            fprintf(stderr, "Unknown uninstall option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    printf("Uninstalling WineCord setup...\n");
+    fflush(stdout);
+    if (!skip_bottle) remove_bottle_setup(bottle);
+    uninstall_agent();
+
+    if (!keep_config) {
+        remove_file_if_exists(cfg->config_path);
+        if (rmdir(cfg->app_dir) == 0) printf("Removed: %s\n", cfg->app_dir);
+    }
+
+    if (!keep_logs) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/agent.log", cfg->log_dir);
+        remove_file_if_exists(path);
+        snprintf(path, sizeof(path), "%s/agent.err.log", cfg->log_dir);
+        remove_file_if_exists(path);
+        if (rmdir(cfg->log_dir) == 0) printf("Removed: %s\n", cfg->log_dir);
+    }
+
+    printf("\nWineCord setup removed. You can now run `brew uninstall winecord` to remove the package.\n");
+    return 0;
+}
+
 static void usage(FILE *out) {
     fprintf(out,
             "WineCord %s\n"
             "Created by Zard Studios. Copyright (c) 2026 Zard Studios.\n\n"
             "Usage:\n"
+            "  winecord setup [--bottle PATH] [--helper PATH] [--no-register]\n"
+            "  winecord uninstall [--bottle PATH] [--keep-config] [--keep-logs]\n"
             "  winecord agent\n"
             "  winecord doctor\n"
             "  winecord install-agent\n"
@@ -941,6 +1089,8 @@ int main(int argc, char **argv) {
         printf("Created by Zard Studios. Copyright (c) 2026 Zard Studios.\n");
         return 0;
     }
+    if (strcmp(cmd, "setup") == 0) return setup_all(&cfg, argc - 2, argv + 2);
+    if (strcmp(cmd, "uninstall") == 0) return uninstall_all(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "agent") == 0) return run_agent(&cfg);
     if (strcmp(cmd, "doctor") == 0) return doctor(&cfg);
     if (strcmp(cmd, "install-agent") == 0) return install_agent(&cfg);

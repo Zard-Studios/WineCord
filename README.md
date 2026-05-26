@@ -11,52 +11,81 @@ It is built as two small pieces:
   bottle, creates `\\.\pipe\discord-ipc-0..9`, and forwards pipe traffic to the
   macOS agent using a local token.
 
-No Electron, no Node runtime, no background service with root privileges.
+No Electron, no Node runtime, no background service with root privileges, and
+no build step for normal users.
 
-## Build
-
-```sh
-make
-```
-
-The macOS binary is written to `build/winecord`.
-
-To build the Wine helper you need a MinGW-w64 compiler:
+## Install
 
 ```sh
-make windows-helper
+brew install zard-studios/tap/winecord
+winecord setup
 ```
 
-That produces `build/winecord-bridge.exe`.
-
-## Quick Start With CrossOver
-
-Start Discord for macOS, then:
+When WineCord is accepted into Homebrew core, the install command becomes:
 
 ```sh
-./build/winecord doctor
-./build/winecord install-agent
-./build/winecord start
-./build/winecord install-bottle --bottle "/path/to/CrossOver/Bottles/Steam"
+brew install winecord
+winecord setup
 ```
 
-`install-bottle` copies the helper into `C:\windows\winecord-bridge.exe`,
-writes the shared token config into `C:\users\Public\WineCord\config.ini`, and
-tries to register the helper as a Wine service through CrossOver.
+For a single command that installs through Homebrew and immediately configures
+the detected CrossOver Steam bottle:
 
-If the helper has not been built yet, run `make windows-helper` first.
+```sh
+curl -fsSL https://raw.githubusercontent.com/Zard-Studios/WineCord/main/scripts/install.sh | sh
+```
+
+If your bottle is not auto-detected:
+
+```sh
+winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
+```
+
+`winecord setup` installs the per-user LaunchAgent, starts the native macOS
+agent, copies the bundled `winecord-bridge.exe` into the CrossOver bottle,
+writes the shared token config, and registers the Wine service. Users do not
+need MinGW, Xcode, or any build tool.
+
+## Uninstall
+
+```sh
+winecord uninstall
+brew uninstall winecord
+```
+
+`winecord uninstall` removes the LaunchAgent, the Wine service, the helper from
+the bottle, WineCord config, and WineCord logs. Use it before `brew uninstall`
+so the bottle is cleaned while the CLI is still available.
 
 ## Commands
 
 ```sh
-winecord agent             # run the macOS forwarding agent in the foreground
+winecord setup             # one-command local configuration
+winecord uninstall         # remove LaunchAgent, bottle helper, config, and logs
 winecord doctor            # show config, Discord IPC, and CrossOver diagnostics
-winecord install-agent     # install a per-user LaunchAgent
-winecord uninstall-agent   # remove the LaunchAgent
-winecord start             # start the LaunchAgent
-winecord stop              # stop the LaunchAgent
-winecord install-bottle --bottle PATH [--helper PATH] [--no-register]
+winecord agent             # run the macOS forwarding agent in the foreground
 ```
+
+Advanced commands are still available for package managers and diagnostics:
+
+```sh
+winecord install-agent
+winecord uninstall-agent
+winecord start
+winecord stop
+winecord install-bottle --bottle PATH [--no-register]
+```
+
+## Build From Source
+
+```sh
+make
+make windows-helper
+make package
+```
+
+The release tarball contains a universal macOS binary and the Windows helper:
+`dist/winecord-0.1.0-macos-universal.tar.gz`.
 
 ## Smoke Test
 
