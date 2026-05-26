@@ -85,6 +85,25 @@ avant la désinstallation. Quand WineCord ne peut pas accéder à un préfixe d�
 configuré, il conserve la configuration et les logs locaux, t'avertit et te
 demande de relancer `winecord uninstall` une fois le disque monté.
 
+## ⬆️ Mise À Jour
+
+```sh
+winecord update
+```
+
+Cette commande lance la mise à jour Homebrew, met WineCord à jour et rafraîchit
+le LaunchAgent ainsi que le helper côté Wine déjà installés. Si tu veux
+seulement mettre à jour le paquet Homebrew :
+
+```sh
+winecord update --no-setup
+```
+
+WineCord vérifie l'existence d'une nouvelle release au maximum une fois par
+jour et affiche un avertissement jaune dans le terminal quand une mise à jour
+est disponible. Définis `WINECORD_NO_UPDATE_CHECK=1` pour désactiver cette
+vérification.
+
 ## 📁 Chemins
 
 Configuration :

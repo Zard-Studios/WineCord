@@ -30,6 +30,7 @@ Keep Discord for macOS open, then launch your Windows game.
 
 - Lightweight native bridge for Discord IPC.
 - Homebrew installation through the Zard Studios tap.
+- One-command updates with `winecord update`.
 - Automatic setup for common macOS Wine prefixes.
 - Clean uninstall for the macOS agent and the Wine-side helper.
 

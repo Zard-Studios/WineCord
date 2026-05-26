@@ -83,6 +83,24 @@ uninstalling. When WineCord cannot access a prefix it previously configured, it
 keeps the local config and logs, warns you, and asks you to run `winecord
 uninstall` again after the drive is mounted.
 
+## ⬆️ Update
+
+```sh
+winecord update
+```
+
+This runs the Homebrew update, upgrades WineCord, and refreshes the installed
+LaunchAgent and Wine-side helper. If you only want to upgrade the Homebrew
+package:
+
+```sh
+winecord update --no-setup
+```
+
+WineCord checks for a newer release at most once per day and shows a yellow
+terminal warning when an update is available. Set `WINECORD_NO_UPDATE_CHECK=1`
+to disable that check.
+
 ## 📁 Paths
 
 Config:

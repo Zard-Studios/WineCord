@@ -1,8 +1,8 @@
 class Winecord < Formula
   desc "Discord Rich Presence bridge for Windows games running through Wine on macOS"
   homepage "https://github.com/Zard-Studios/WineCord"
-  url "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/releases/winecord-0.1.8-macos-universal.tar.gz"
-  sha256 "570471300cce7a5ce0c1fb95580c056af9c4b93723f8ca14080670587511c901"
+  url "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/releases/winecord-0.1.9-macos-universal.tar.gz"
+  sha256 "fe5bd2c4df34a625deadbfc05aceb8e2d5e4dd362f4a2e8137a0fd1acaa91ea6"
   license "MIT"
 
   def install
@@ -16,6 +16,9 @@ class Winecord < Formula
     <<~EOS
       Finish setup with:
         winecord setup
+
+      Update WineCord and refresh the installed helper with:
+        winecord update
 
       Remove WineCord's LaunchAgent and Wine-side helper before uninstalling:
         winecord uninstall

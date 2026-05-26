@@ -28,13 +28,15 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.8"
+#define WINECORD_VERSION "0.1.9"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
 #define WINECORD_TOKEN_BYTES 32
 #define MAX_CANDIDATES 64
 #define MAX_TRACKED_BOTTLES 16
+#define WINECORD_UPDATE_CHECK_INTERVAL 86400
+#define WINECORD_FORMULA_URL "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/Formula/winecord.rb"
 
 typedef struct {
     char app_dir[PATH_MAX];
@@ -2412,6 +2414,210 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
     return 0;
 }
 
+static int version_compare(const char *a, const char *b) {
+    const char *pa = a ? a : "";
+    const char *pb = b ? b : "";
+
+    while (*pa || *pb) {
+        while (*pa && !isdigit((unsigned char)*pa)) pa++;
+        while (*pb && !isdigit((unsigned char)*pb)) pb++;
+
+        long va = 0;
+        long vb = 0;
+        while (*pa && isdigit((unsigned char)*pa)) {
+            va = (va * 10) + (*pa - '0');
+            pa++;
+        }
+        while (*pb && isdigit((unsigned char)*pb)) {
+            vb = (vb * 10) + (*pb - '0');
+            pb++;
+        }
+
+        if (va > vb) return 1;
+        if (va < vb) return -1;
+        if (!*pa && !*pb) return 0;
+    }
+
+    return 0;
+}
+
+static void update_cache_path(const Config *cfg, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s/update-check.ini", cfg->app_dir);
+}
+
+static bool read_update_cache(const Config *cfg, long *checked_at, char *latest, size_t latest_len) {
+    char path[PATH_MAX];
+    update_cache_path(cfg, path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+
+    if (checked_at) *checked_at = 0;
+    if (latest && latest_len > 0) latest[0] = '\0';
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        chomp(line);
+        char *p = trim(line);
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = trim(p);
+        char *value = trim(eq + 1);
+        if (strcmp(key, "checked_at") == 0 && checked_at) {
+            *checked_at = strtol(value, NULL, 10);
+        } else if (strcmp(key, "latest") == 0 && latest && latest_len > 0) {
+            snprintf(latest, latest_len, "%s", value);
+        }
+    }
+    fclose(f);
+    return latest && latest[0] != '\0';
+}
+
+static void write_update_cache(const Config *cfg, const char *latest) {
+    if (!latest || !*latest) return;
+    if (mkdir_p(cfg->app_dir, 0700) != 0) return;
+
+    char path[PATH_MAX];
+    update_cache_path(cfg, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "checked_at=%ld\nlatest=%s\n", (long)time(NULL), latest);
+    fclose(f);
+    chmod(path, 0600);
+}
+
+static void clear_update_cache(const Config *cfg) {
+    char path[PATH_MAX];
+    update_cache_path(cfg, path, sizeof(path));
+    unlink(path);
+}
+
+static bool fetch_latest_version(char *out, size_t out_len) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "/usr/bin/curl -fsSL --connect-timeout 1 --max-time 2 %s 2>/dev/null | "
+             "/usr/bin/sed -n 's/.*winecord-\\([0-9][0-9.]*\\)-macos-universal.*/\\1/p' | "
+             "/usr/bin/head -n 1",
+             WINECORD_FORMULA_URL);
+    return command_capture(cmd, out, out_len) == 0;
+}
+
+static bool should_skip_update_notice(const char *cmd) {
+    if (!cmd || !*cmd) return true;
+    return strcmp(cmd, "agent") == 0 ||
+           strcmp(cmd, "update") == 0 ||
+           strcmp(cmd, "--version") == 0 ||
+           strcmp(cmd, "version") == 0 ||
+           strcmp(cmd, "--help") == 0 ||
+           strcmp(cmd, "help") == 0;
+}
+
+static void maybe_print_update_notice(const Config *cfg, const char *cmd) {
+    const char *disabled = getenv("WINECORD_NO_UPDATE_CHECK");
+    if (disabled && *disabled && strcmp(disabled, "0") != 0) return;
+    if (should_skip_update_notice(cmd)) return;
+    if (!isatty(STDERR_FILENO)) return;
+
+    char latest[64] = "";
+    long checked_at = 0;
+    time_t now = time(NULL);
+    bool fresh = read_update_cache(cfg, &checked_at, latest, sizeof(latest)) &&
+                 checked_at > 0 &&
+                 now >= (time_t)checked_at &&
+                 now - (time_t)checked_at < WINECORD_UPDATE_CHECK_INTERVAL;
+
+    if (!fresh) {
+        latest[0] = '\0';
+        if (!fetch_latest_version(latest, sizeof(latest))) return;
+        write_update_cache(cfg, latest);
+    }
+
+    if (version_compare(latest, WINECORD_VERSION) > 0) {
+        fprintf(stderr,
+                "\033[33mWARNING: You are using WineCord version %s; however, version %s is available.\033[0m\n"
+                "You should consider upgrading via the 'winecord update' command.\n\n",
+                WINECORD_VERSION, latest);
+    }
+}
+
+static int run_process(char *const argv[]) {
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork failed: %s\n", strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        execv(argv[0], argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "waitpid failed: %s\n", strerror(errno));
+        return 1;
+    }
+    if (!WIFEXITED(status)) return 1;
+    return WEXITSTATUS(status);
+}
+
+static bool brew_prefix_for_winecord(const char *brew, char *out, size_t out_len) {
+    char qbrew[PATH_MAX + 8];
+    char cmd[(PATH_MAX * 2) + 64];
+    if (shell_quote(brew, qbrew, sizeof(qbrew)) != 0) return false;
+    snprintf(cmd, sizeof(cmd), "%s --prefix winecord 2>/dev/null", qbrew);
+    return command_capture(cmd, out, out_len) == 0 && is_directory(out);
+}
+
+static int update_winecord(const Config *cfg, int argc, char **argv) {
+    bool refresh_setup = true;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--no-setup") == 0) {
+            refresh_setup = false;
+        } else {
+            fprintf(stderr, "Unknown update option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    char brew[PATH_MAX];
+    if (!command_path("brew", brew, sizeof(brew))) {
+        fprintf(stderr, "Homebrew was not found. Install WineCord with Homebrew to use `winecord update`.\n");
+        return 1;
+    }
+
+    printf("Updating WineCord through Homebrew...\n\n");
+    char *update_argv[] = { brew, "update", NULL };
+    int update_status = run_process(update_argv);
+    if (update_status != 0) return update_status;
+
+    char *upgrade_argv[] = { brew, "upgrade", "zard-studios/tap/winecord", NULL };
+    int upgrade_status = run_process(upgrade_argv);
+    if (upgrade_status != 0) return upgrade_status;
+
+    clear_update_cache(cfg);
+    if (!refresh_setup) {
+        printf("\nWineCord update complete.\n");
+        return 0;
+    }
+
+    char updated_exe[PATH_MAX] = "";
+    char brew_prefix[PATH_MAX] = "";
+    if (brew_prefix_for_winecord(brew, brew_prefix, sizeof(brew_prefix))) {
+        snprintf(updated_exe, sizeof(updated_exe), "%s/bin/winecord", brew_prefix);
+    }
+    if (!path_exists(updated_exe)) launch_executable(updated_exe, sizeof(updated_exe));
+
+    printf("\nRefreshing WineCord setup...\n");
+    char *setup_argv[] = { updated_exe, "setup", NULL };
+    int setup_status = run_process(setup_argv);
+    if (setup_status != 0) return setup_status;
+
+    printf("\nWineCord update complete.\n");
+    return 0;
+}
+
 static void usage(FILE *out) {
     fprintf(out,
             "WineCord %s\n"
@@ -2427,6 +2633,7 @@ static void usage(FILE *out) {
             "  winecord uninstall-agent\n"
             "  winecord start\n"
             "  winecord stop\n"
+            "  winecord update [--no-setup]\n"
             "  winecord install-bottle [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
             "  winecord install-prefix [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
             "  winecord --version\n",
@@ -2443,6 +2650,8 @@ int main(int argc, char **argv) {
     }
 
     const char *cmd = argv[1];
+    maybe_print_update_notice(&cfg, cmd);
+
     if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "version") == 0) {
         printf("WineCord %s\n", WINECORD_VERSION);
         printf("Created by Zard Studios. Copyright (c) 2026 Zard Studios.\n");
@@ -2458,6 +2667,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "uninstall-agent") == 0) return uninstall_agent();
     if (strcmp(cmd, "start") == 0) return start_agent(&cfg);
     if (strcmp(cmd, "stop") == 0) return stop_agent();
+    if (strcmp(cmd, "update") == 0) return update_winecord(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "install-bottle") == 0 || strcmp(cmd, "install-prefix") == 0) {
         return install_bottle(&cfg, argc - 2, argv + 2);
     }
