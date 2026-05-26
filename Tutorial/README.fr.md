@@ -9,50 +9,65 @@ brew install zard-studios/tap/winecord
 winecord setup
 ```
 
-C'est la configuration normale. `winecord setup` détecte la bottle Steam de
-CrossOver, installe l'agent macOS, copie le bridge Windows dans la bottle, écrit
-la configuration locale et enregistre le service Wine.
+C'est le flux normal. `winecord setup` installe le LaunchAgent macOS, détecte
+automatiquement les préfixes Wine courants, copie le bridge Windows dans chaque
+préfixe configuré, écrit le fichier de connexion local et enregistre le service
+Wine.
 
-Après la configuration, garde Discord pour macOS ouvert et lance le jeu Windows
-depuis CrossOver ou depuis Steam dans CrossOver.
+Garde Discord pour macOS ouvert, puis lance le jeu Windows depuis ton app Wine.
 
-## 🍾 Si la bottle n'est pas détectée
+## 🧭 Détection Automatique
 
-Utilise cette commande si ta bottle Steam se trouve dans un emplacement
-personnalisé :
+WineCord recherche les préfixes déjà initialisés dans les emplacements macOS les
+plus courants pour CrossOver, Whisky, les wrappers Wineskin, Heroic, Wine
+standard et `~/.wine`.
+
+Pour Whisky, installer WhiskyCmd depuis `Whisky > Install Whisky CLI...` donne
+à WineCord la méthode la plus propre pour exécuter le helper dans une bottle
+enregistrée. Si WhiskyCmd n'est pas disponible, WineCord essaie quand même le
+runner Wine inclus.
+
+## 🧩 Configuration Manuelle
+
+Utilise un préfixe manuel seulement si la détection automatique ne trouve pas
+ton app. Un préfixe est le dossier qui contient `drive_c`.
+
+```sh
+winecord setup --prefix "/chemin/du/prefixe"
+```
+
+Si ce préfixe nécessite un binaire Wine précis :
+
+```sh
+winecord setup --prefix "/chemin/du/prefixe" --wine "/chemin/vers/wine"
+```
+
+L'ancien flag de style CrossOver reste compatible :
 
 ```sh
 winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
 ```
 
-Pour plusieurs bottles, lance la configuration une fois par bottle :
-
-```sh
-winecord setup --bottle "/path/to/CrossOver/Bottles/GameBottle"
-```
-
-## 🧪 Vérifier ou déboguer
+## 🧪 Vérifier Ou Déboguer
 
 ```sh
 winecord doctor
 winecord logs --follow
 ```
 
-`winecord doctor` vérifie le socket local de Discord, la configuration WineCord,
-la détection de CrossOver, le helper installé et le chemin du LaunchAgent.
+`winecord doctor` vérifie Discord IPC, le LaunchAgent, les préfixes détectés,
+le runner Wine et le helper installé.
 
-`winecord logs --follow` affiche l'activité du bridge en direct. Quand un jeu
-ouvre Discord IPC, tu verras la connexion à la pipe et la première trame IPC. Si
-un jeu utilise seulement Steam Rich Presence ou la détection de jeu de Discord,
-WineCord peut ne rien avoir à transmettre.
+`winecord logs --follow` affiche l'activité du bridge en temps réel. Quand un
+jeu ouvre Discord IPC, tu verras la connexion à la pipe et le premier frame IPC.
+Si un jeu utilise seulement Steam Rich Presence ou la détection de jeu de
+Discord, WineCord peut ne rien avoir à transférer pour l'instant.
 
-Si Discord continue d'afficher un jeu après sa fermeture, lance :
+Si Discord continue d'afficher un jeu après sa fermeture :
 
 ```sh
 winecord clear
 ```
-
-Cela demande à Discord d'effacer la dernière activité vue par WineCord.
 
 ## 🧹 Désinstallation
 
@@ -61,18 +76,31 @@ winecord uninstall
 brew uninstall winecord
 ```
 
-Lance d'abord `winecord uninstall` pour que WineCord puisse supprimer le
-LaunchAgent, le service Wine, le helper, la configuration et les logs pendant
+Lance d'abord `winecord uninstall`. Cela supprime le LaunchAgent, le service
+Wine, le helper, la configuration dans les préfixes et les logs WineCord tant
 que la CLI est encore installée.
 
-Si ta bottle CrossOver se trouve sur un disque externe, connecte ce disque avant
-la désinstallation. Quand WineCord ne peut pas accéder à une bottle qu'il avait
-configurée, il conserve la configuration et les logs locaux, t'avertit et te
-demande de relancer `winecord uninstall` après avoir monté le disque.
+Si un préfixe configuré se trouve sur un disque externe, connecte ce disque
+avant la désinstallation. Quand WineCord ne peut pas accéder à un préfixe déjà
+configuré, il conserve la configuration et les logs locaux, t'avertit et te
+demande de relancer `winecord uninstall` une fois le disque monté.
 
-## 🛠 Notes pour les mainteneurs
+## 📁 Chemins
 
-Compiler et empaqueter :
+Configuration :
+
+```text
+~/Library/Application Support/WineCord/config.ini
+```
+
+Logs :
+
+```text
+~/Library/Logs/WineCord/
+drive_c/users/Public/WineCord/bridge.log
+```
+
+## 🛠 Maintenance
 
 ```sh
 make
@@ -80,30 +108,6 @@ make windows-helper
 make package
 ```
 
-Smoke test local:
-
-```sh
-make windows-smoke
-CX_BOTTLE_PATH="/path/to/CrossOver/Bottles" \
-  "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine" \
-  --bottle Steam --no-gui ./build/pipe-smoke.exe
-```
-
-La réponse attendue pour le smoke test inclus est le close frame `Invalid Client
-ID` de Discord. C'est positif : cela prouve que les octets sont passés par la
-named pipe Windows, le helper Wine, l'agent macOS et Discord.
-
-## 📁 Chemins
-
-Configuration:
-
-```text
-~/Library/Application Support/WineCord/config.ini
-```
-
-Logs:
-
-```text
-~/Library/Logs/WineCord/
-drive_c/users/Public/WineCord/bridge.log
-```
+Le smoke test inclus attend le close frame `Invalid Client ID` de Discord.
+C'est utile : cela prouve que les octets sont passés par la named pipe Windows,
+le helper Wine, l'agent macOS et Discord.

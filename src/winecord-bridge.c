@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define WINECORD_VERSION "0.1.6"
+#define WINECORD_VERSION "0.1.7"
 #define SERVICE_NAME "WineCordBridge"
 #define CONFIG_PATH "C:\\users\\Public\\WineCord\\config.ini"
 #define LOG_PATH "C:\\users\\Public\\WineCord\\bridge.log"
@@ -548,7 +548,7 @@ static int install_service(void) {
     }
 
     SERVICE_DESCRIPTIONA desc;
-    desc.lpDescription = "Forwards Discord Rich Presence IPC from Wine/CrossOver games to WineCord on macOS.";
+    desc.lpDescription = "Forwards Discord Rich Presence IPC from Wine games to WineCord on macOS.";
     ChangeServiceConfig2A(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
 
     if (!StartServiceA(svc, 0, NULL) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {

@@ -1,8 +1,8 @@
 class Winecord < Formula
-  desc "Discord Rich Presence bridge for Wine/CrossOver games on macOS"
+  desc "Discord Rich Presence bridge for Windows games running through Wine on macOS"
   homepage "https://github.com/Zard-Studios/WineCord"
-  url "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/releases/winecord-0.1.6-macos-universal.tar.gz"
-  sha256 "e0eeac20aceafbd45259751c1d7aafa97bc320fc6a6430ac86f325d7aaceb862"
+  url "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/releases/winecord-0.1.7-macos-universal.tar.gz"
+  sha256 "efcb76338a83a004e68ecd0144ebf6809f6b177f0dd39a2ad4b93922a881d548"
   license "MIT"
 
   def install
@@ -17,14 +17,17 @@ class Winecord < Formula
       Finish setup with:
         winecord setup
 
-      Remove WineCord's LaunchAgent and CrossOver bottle helper before uninstalling:
+      Remove WineCord's LaunchAgent and Wine-side helper before uninstalling:
         winecord uninstall
         brew uninstall winecord
 
-      If the configured CrossOver bottle is on an external volume, connect it before running winecord uninstall.
+      If a configured Wine prefix is on an external volume, connect it before running winecord uninstall.
 
-      If your CrossOver Steam bottle is not auto-detected:
-        winecord setup --bottle /path/to/CrossOver/Bottles/Steam
+      If your Wine prefix is not auto-detected:
+        winecord setup --prefix /path/to/prefix
+
+      If that prefix needs a specific Wine runner:
+        winecord setup --prefix /path/to/prefix --wine /path/to/wine
     EOS
   end
 

@@ -1,6 +1,6 @@
 # WineCord
 
-A tiny Discord Rich Presence bridge for Windows games running on macOS through Wine or CrossOver.
+A tiny Discord Rich Presence bridge for Windows games running on macOS through Wine apps.
 
 <div align="center">
   <img src="https://github.com/user-attachments/assets/63d64bea-4af8-47e0-aa1b-951257dc33a0" alt="Screenshot 2026-05-26 alle 17 11" width="500" />
@@ -13,21 +13,25 @@ A tiny Discord Rich Presence bridge for Windows games running on macOS through W
 
 </div>
 
-## 🚀 Setup & Documentation / Configurazione
+## 🚀 Setup
 
-Select your language to start the setup guide / Seleziona la tua lingua per iniziare la guida all'installazione:
+```sh
+brew install zard-studios/tap/winecord
+winecord setup
+```
 
-- [English 🇬🇧 (Setup Guide)](Tutorial/README.en.md)
-- [Italiano 🇮🇹 (Guida all'installazione)](Tutorial/README.it.md)
-- [Español 🇪🇸 (Guia de instalación)](Tutorial/README.es.md)
-- [Français 🇫🇷 (Guide d'installation)](Tutorial/README.fr.md)
+Keep Discord for macOS open, then launch your Windows game.
+
+## 🌍 Language / Lingua / Idioma / Langue
+
+[English](Tutorial/README.en.md) | [Italiano](Tutorial/README.it.md) | [Español](Tutorial/README.es.md) | [Français](Tutorial/README.fr.md)
 
 ## ✨ Highlights
 
 - Lightweight native bridge for Discord IPC.
 - Homebrew installation through the Zard Studios tap.
-- Designed for Wine and CrossOver bottles on macOS.
-- Easy to setup and clean uninstall.
+- Automatic setup for common macOS Wine prefixes.
+- Clean uninstall for the macOS agent and the Wine-side helper.
 
 ## 🤝 Credits
 

@@ -28,7 +28,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.6"
+#define WINECORD_VERSION "0.1.7"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
@@ -43,6 +43,7 @@ typedef struct {
     char host[64];
     int port;
     char token[(WINECORD_TOKEN_BYTES * 2) + 1];
+    char wine_path[PATH_MAX];
     char bottle_paths[MAX_TRACKED_BOTTLES][PATH_MAX];
     int bottle_count;
 } Config;
@@ -62,6 +63,10 @@ typedef struct {
 } IpcSession;
 
 static void usage(FILE *out);
+static bool find_whisky_runner(const char *prefix, char *whisky_path, size_t whisky_len,
+                               char *bottle_name, size_t name_len);
+static bool find_wine_runner(const Config *cfg, const char *prefix,
+                             const char *override_wine, char *out, size_t out_len);
 
 static const char *home_dir(void) {
     const char *home = getenv("HOME");
@@ -184,7 +189,15 @@ static void normalize_path_copy(char *out, size_t out_len, const char *path) {
     out[0] = '\0';
     if (!path || !*path) return;
 
-    if (snprintf(out, out_len, "%s", path) >= (int)out_len) {
+    const char *src = path;
+    char expanded[PATH_MAX];
+    if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
+        if (snprintf(expanded, sizeof(expanded), "%s%s", home_dir(), path + 1) < (int)sizeof(expanded)) {
+            src = expanded;
+        }
+    }
+
+    if (snprintf(out, out_len, "%s", src) >= (int)out_len) {
         out[out_len - 1] = '\0';
     }
     size_t len = strlen(out);
@@ -268,8 +281,9 @@ static int save_config(const Config *cfg) {
     fprintf(f, "host=%s\n", cfg->host);
     fprintf(f, "port=%d\n", cfg->port);
     fprintf(f, "token=%s\n", cfg->token);
+    if (cfg->wine_path[0]) fprintf(f, "wine=%s\n", cfg->wine_path);
     for (int i = 0; i < cfg->bottle_count; i++) {
-        fprintf(f, "bottle=%s\n", cfg->bottle_paths[i]);
+        fprintf(f, "prefix=%s\n", cfg->bottle_paths[i]);
     }
     fclose(f);
     chmod(cfg->config_path, 0600);
@@ -304,7 +318,9 @@ static int load_config(Config *cfg) {
             cfg->port = atoi(value);
         } else if (strcmp(key, "token") == 0 && *value) {
             snprintf(cfg->token, sizeof(cfg->token), "%s", value);
-        } else if (strcmp(key, "bottle") == 0 && *value) {
+        } else if (strcmp(key, "wine") == 0 && *value) {
+            normalize_path_copy(cfg->wine_path, sizeof(cfg->wine_path), value);
+        } else if ((strcmp(key, "prefix") == 0 || strcmp(key, "bottle") == 0) && *value) {
             remember_bottle(cfg, value);
         }
     }
@@ -893,56 +909,162 @@ static void print_discord_sockets(void) {
     }
 }
 
-static void discover_steam_bottle(char *out, size_t out_len) {
-    out[0] = '\0';
+static bool is_wine_prefix(const char *path) {
+    if (!path || !is_directory(path)) return false;
+    char drive_c[PATH_MAX];
+    snprintf(drive_c, sizeof(drive_c), "%s/drive_c", path);
+    return is_directory(drive_c);
+}
 
-    const char *env = getenv("WINECORD_BOTTLE");
-    if (env && *env && is_directory(env)) {
-        snprintf(out, out_len, "%s", env);
-        return;
+static bool path_has_component(const char *path, const char *needle) {
+    return path && needle && strstr(path, needle) != NULL;
+}
+
+static void add_prefix_candidate(char paths[][PATH_MAX], int *count, const char *path) {
+    if (!path || !*path || !paths || !count || *count >= MAX_TRACKED_BOTTLES) return;
+
+    char normalized[PATH_MAX];
+    char resolved[PATH_MAX];
+    char clean[PATH_MAX];
+    normalize_path_copy(clean, sizeof(clean), path);
+    if (realpath(clean, resolved)) normalize_path_copy(normalized, sizeof(normalized), resolved);
+    else normalize_path_copy(normalized, sizeof(normalized), clean);
+    if (!is_wine_prefix(normalized)) return;
+
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(paths[i], normalized) == 0) return;
     }
+    snprintf(paths[*count], PATH_MAX, "%s", normalized);
+    (*count)++;
+}
 
+static void add_prefix_glob(char paths[][PATH_MAX], int *count, const char *pattern) {
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+    if (glob(pattern, 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc && *count < MAX_TRACKED_BOTTLES; i++) {
+            add_prefix_candidate(paths, count, g.gl_pathv[i]);
+        }
+    }
+    globfree(&g);
+}
+
+static void add_whisky_cli_prefixes(char paths[][PATH_MAX], int *count) {
+    FILE *p = popen("command -v whisky >/dev/null 2>&1 && whisky list 2>/dev/null", "r");
+    if (!p) return;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), p) && *count < MAX_TRACKED_BOTTLES) {
+        if (line[0] != '|') continue;
+        char *last = strrchr(line, '|');
+        if (!last) continue;
+        *last = '\0';
+        char *prev = strrchr(line, '|');
+        if (!prev) continue;
+        char *path = trim(prev + 1);
+        if (*path == '~' || *path == '/') add_prefix_candidate(paths, count, path);
+    }
+    pclose(p);
+}
+
+static void add_crossOver_prefixes(char paths[][PATH_MAX], int *count) {
     char base[PATH_MAX];
     const char *commands[] = {
         "defaults read com.codeweavers.CrossOver BottleDir 2>/dev/null",
+        "defaults read com.codeweavers.CrossOver.plist BottleDir 2>/dev/null",
         "defaults read com.codeweavers.CrossOverGames BottleDir 2>/dev/null",
+        "defaults read com.codeweavers.CrossOverGames.plist BottleDir 2>/dev/null",
+        "defaults read com.codeweavers.CrossOver ManagedBottleDirs 2>/dev/null",
+        "defaults read com.codeweavers.CrossOver.plist ManagedBottleDirs 2>/dev/null",
         NULL
     };
 
     for (int i = 0; commands[i]; i++) {
         if (command_capture(commands[i], base, sizeof(base)) == 0) {
-            char candidate[PATH_MAX];
-            snprintf(candidate, sizeof(candidate), "%s/Steam", base);
-            if (is_directory(candidate)) {
-                snprintf(out, out_len, "%s", candidate);
-                return;
-            }
+            char pattern[PATH_MAX];
+            snprintf(pattern, sizeof(pattern), "%s/*", base);
+            add_prefix_glob(paths, count, pattern);
         }
     }
 
-    snprintf(base, sizeof(base), "%s/Library/Application Support/CrossOver/Bottles/Steam", home_dir());
-    if (is_directory(base)) snprintf(out, out_len, "%s", base);
+    snprintf(base, sizeof(base), "%s/Library/Application Support/CrossOver/Bottles/*", home_dir());
+    add_prefix_glob(paths, count, base);
+}
+
+static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int max_paths) {
+    int count = 0;
+    if (max_paths <= 0) return 0;
+
+    const char *envs[] = {
+        getenv("WINECORD_PREFIX"),
+        getenv("WINECORD_BOTTLE"),
+        getenv("WINEPREFIX")
+    };
+    for (int i = 0; i < 3 && count < max_paths; i++) add_prefix_candidate(paths, &count, envs[i]);
+
+    if (cfg) {
+        for (int i = 0; i < cfg->bottle_count && count < max_paths; i++) {
+            add_prefix_candidate(paths, &count, cfg->bottle_paths[i]);
+        }
+    }
+
+    add_crossOver_prefixes(paths, &count);
+    add_whisky_cli_prefixes(paths, &count);
+
+    char pattern[PATH_MAX];
+    snprintf(pattern, sizeof(pattern), "%s/Library/Containers/com.isaacmarovitz.Whisky/Bottles/*", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+    snprintf(pattern, sizeof(pattern), "%s/Library/Containers/com.franke.Whisky/Bottles/*", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+
+    snprintf(pattern, sizeof(pattern), "%s/Games/Heroic/Prefixes/*", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+    snprintf(pattern, sizeof(pattern), "%s/Games/Heroic/Prefixes/default/*", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+    snprintf(pattern, sizeof(pattern), "%s/Library/Application Support/heroic/Prefixes/*", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+
+    snprintf(pattern, sizeof(pattern), "%s/Applications/*.app/Contents/SharedSupport/prefix", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+    add_prefix_glob(paths, &count, "/Applications/*.app/Contents/SharedSupport/prefix");
+
+    snprintf(pattern, sizeof(pattern), "%s/.wine", home_dir());
+    add_prefix_candidate(paths, &count, pattern);
+    snprintf(pattern, sizeof(pattern), "%s/wineprefixes/*", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+    snprintf(pattern, sizeof(pattern), "%s/Wine Prefixes/*", home_dir());
+    add_prefix_glob(paths, &count, pattern);
+
+    return count;
 }
 
 static void resolve_bottle(const Config *cfg, char *out, size_t out_len) {
     out[0] = '\0';
 
-    const char *env = getenv("WINECORD_BOTTLE");
-    if (env && *env && is_directory(env)) {
+    const char *env = getenv("WINECORD_PREFIX");
+    if (env && *env && is_wine_prefix(env)) {
+        normalize_path_copy(out, out_len, env);
+        return;
+    }
+
+    env = getenv("WINECORD_BOTTLE");
+    if (env && *env && is_wine_prefix(env)) {
         normalize_path_copy(out, out_len, env);
         return;
     }
 
     if (cfg) {
         for (int i = 0; i < cfg->bottle_count; i++) {
-            if (is_directory(cfg->bottle_paths[i])) {
+            if (is_wine_prefix(cfg->bottle_paths[i])) {
                 normalize_path_copy(out, out_len, cfg->bottle_paths[i]);
                 return;
             }
         }
     }
 
-    discover_steam_bottle(out, out_len);
+    char prefixes[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
+    if (count > 0) snprintf(out, out_len, "%s", prefixes[0]);
 }
 
 static int doctor(const Config *cfg) {
@@ -960,23 +1082,32 @@ static int doctor(const Config *cfg) {
     printf("\n");
     print_discord_sockets();
 
-    char bottle[PATH_MAX];
-    resolve_bottle(cfg, bottle, sizeof(bottle));
-    printf("\nCrossOver:\n");
-    printf("  app:    %s\n", is_directory("/Applications/CrossOver.app") ? "/Applications/CrossOver.app" : "not found");
-    printf("  bottle: %s\n", bottle[0] ? bottle : "not found; pass --bottle PATH");
-    if (cfg->bottle_count > 0) {
-        printf("  known bottles:\n");
-        for (int i = 0; i < cfg->bottle_count; i++) {
-            printf("    %s (%s)\n", cfg->bottle_paths[i],
-                   is_directory(cfg->bottle_paths[i]) ? "available" : "missing");
-        }
+    char prefixes[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int prefix_count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
+    printf("\nWine:\n");
+    printf("  CrossOver: %s\n", is_directory("/Applications/CrossOver.app") ? "/Applications/CrossOver.app" : "not found");
+    printf("  Whisky:    %s\n", is_directory("/Applications/Whisky.app") ? "/Applications/Whisky.app" : "not found");
+    printf("  saved wine runner: %s\n", cfg->wine_path[0] ? cfg->wine_path : "not set");
+    if (prefix_count == 0) {
+        printf("  prefixes: not found; pass --prefix PATH\n");
+    } else {
+        printf("  prefixes:\n");
     }
-
-    if (bottle[0]) {
+    for (int i = 0; i < prefix_count; i++) {
+        const char *bottle = prefixes[i];
+        char runner[PATH_MAX] = "";
+        char whisky_path[PATH_MAX] = "";
+        char whisky_name[256] = "";
         char helper[PATH_MAX];
         snprintf(helper, sizeof(helper), "%s/drive_c/windows/winecord-bridge.exe", bottle);
-        printf("  helper: %s\n", path_exists(helper) ? helper : "not installed");
+        if (find_whisky_runner(bottle, whisky_path, sizeof(whisky_path), whisky_name, sizeof(whisky_name))) {
+            snprintf(runner, sizeof(runner), "%s run %s", whisky_path, whisky_name);
+        } else {
+            find_wine_runner(cfg, bottle, NULL, runner, sizeof(runner));
+        }
+        printf("    %s\n", bottle);
+        printf("      runner: %s\n", runner[0] ? runner : "not found; pass --wine PATH");
+        printf("      helper: %s\n", path_exists(helper) ? helper : "not installed");
     }
 
     char cmd[256];
@@ -1038,7 +1169,7 @@ static int show_logs(const Config *cfg, int argc, char **argv) {
     bool follow = false;
 
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--bottle") == 0 && i + 1 < argc) {
+        if ((strcmp(argv[i], "--bottle") == 0 || strcmp(argv[i], "--prefix") == 0) && i + 1 < argc) {
             bottle = argv[++i];
         } else if (strcmp(argv[i], "--follow") == 0 || strcmp(argv[i], "-f") == 0) {
             follow = true;
@@ -1427,8 +1558,368 @@ static const char *base_name(const char *path) {
     return slash ? slash + 1 : path;
 }
 
-static int run_crossover_helper(const char *bottle, const char *helper_path, const char *helper_arg, bool quiet) {
-    const char *wine = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine";
+static bool is_safe_command_name(const char *name) {
+    if (!name || !*name) return false;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (isalnum(*p) || *p == '_' || *p == '-' || *p == '.' || *p == '+') continue;
+        return false;
+    }
+    return true;
+}
+
+static bool command_path(const char *name, char *out, size_t out_len) {
+    if (!is_safe_command_name(name)) return false;
+    char cmd[128];
+    if (snprintf(cmd, sizeof(cmd), "command -v %s 2>/dev/null", name) >= (int)sizeof(cmd)) return false;
+    return command_capture(cmd, out, out_len) == 0 && path_exists(out);
+}
+
+static char *read_text_file_limited(const char *path, size_t limit) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size < 0 || (size_t)size > limit) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+
+    char *buf = calloc((size_t)size + 1, 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+static bool json_string_after_key(const char *json, const char *key, char *out, size_t out_len) {
+    if (!json || !key || !out || out_len == 0) return false;
+    out[0] = '\0';
+
+    char needle[128];
+    if (snprintf(needle, sizeof(needle), "\"%s\"", key) >= (int)sizeof(needle)) return false;
+    const char *p = strstr(json, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != ':') return false;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '"') return false;
+    p++;
+
+    size_t pos = 0;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\') {
+            c = *p++;
+            if (!c) return false;
+            switch (c) {
+                case '"':
+                case '\\':
+                case '/':
+                    break;
+                case 'n':
+                    c = '\n';
+                    break;
+                case 'r':
+                    c = '\r';
+                    break;
+                case 't':
+                    c = '\t';
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (pos + 1 >= out_len) return false;
+        out[pos++] = c;
+    }
+    if (*p != '"') return false;
+    out[pos] = '\0';
+    return out[0] != '\0';
+}
+
+static bool prefix_matches_configured_prefix(const char *prefix, const char *configured) {
+    char normalized_prefix[PATH_MAX];
+    char normalized_configured[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    if (realpath(prefix, resolved)) normalize_path_copy(normalized_prefix, sizeof(normalized_prefix), resolved);
+    else normalize_path_copy(normalized_prefix, sizeof(normalized_prefix), prefix);
+
+    if (realpath(configured, resolved)) normalize_path_copy(normalized_configured, sizeof(normalized_configured), resolved);
+    else normalize_path_copy(normalized_configured, sizeof(normalized_configured), configured);
+
+    if (strcmp(normalized_prefix, normalized_configured) == 0) return true;
+
+    size_t len = strlen(normalized_configured);
+    return len > 0 &&
+           strncmp(normalized_prefix, normalized_configured, len) == 0 &&
+           normalized_prefix[len] == '/';
+}
+
+static bool heroic_runner_from_json(const char *path, const char *prefix, char *out, size_t out_len) {
+    char *json = read_text_file_limited(path, 1024 * 1024);
+    if (!json) return false;
+
+    char configured_prefix[PATH_MAX];
+    char runner[PATH_MAX];
+    bool found = false;
+    if (json_string_after_key(json, "winePrefix", configured_prefix, sizeof(configured_prefix)) &&
+        prefix_matches_configured_prefix(prefix, configured_prefix) &&
+        json_string_after_key(json, "bin", runner, sizeof(runner)) &&
+        path_exists(runner)) {
+        normalize_path_copy(out, out_len, runner);
+        found = true;
+    }
+    free(json);
+    return found;
+}
+
+static bool find_heroic_runner(const char *prefix, char *out, size_t out_len) {
+    if (!prefix || !*prefix) return false;
+
+    char path[PATH_MAX];
+    const char *bases[] = {
+        "%s/Library/Application Support/heroic/GamesConfig/*.json",
+        "%s/Library/Application Support/Heroic/GamesConfig/*.json",
+        NULL
+    };
+
+    for (int i = 0; bases[i]; i++) {
+        if (snprintf(path, sizeof(path), bases[i], home_dir()) >= (int)sizeof(path)) continue;
+        glob_t g;
+        memset(&g, 0, sizeof(g));
+        if (glob(path, 0, NULL, &g) == 0) {
+            for (size_t j = 0; j < g.gl_pathc; j++) {
+                if (heroic_runner_from_json(g.gl_pathv[j], prefix, out, out_len)) {
+                    globfree(&g);
+                    return true;
+                }
+            }
+        }
+        globfree(&g);
+    }
+
+    const char *configs[] = {
+        "%s/Library/Application Support/heroic/config.json",
+        "%s/Library/Application Support/heroic/store/config.json",
+        "%s/Library/Application Support/Heroic/config.json",
+        "%s/Library/Application Support/Heroic/store/config.json",
+        NULL
+    };
+    for (int i = 0; configs[i]; i++) {
+        if (snprintf(path, sizeof(path), configs[i], home_dir()) >= (int)sizeof(path)) continue;
+        if (heroic_runner_from_json(path, prefix, out, out_len)) return true;
+    }
+
+    if (path_has_component(prefix, "/Games/Heroic/Prefixes/")) {
+        const char *fallbacks[] = {
+            "%s/Library/Application Support/heroic/tools/game-porting-toolkit/Game-Porting-Toolkit-latest/Contents/Resources/wine/bin/wine64",
+            "%s/Library/Application Support/Heroic/tools/game-porting-toolkit/Game-Porting-Toolkit-latest/Contents/Resources/wine/bin/wine64",
+            "%s/Library/Application Support/heroic/tools/game-porting-toolkit/Game-Porting-Toolkit-latest/Contents/MacOS/wine",
+            "%s/Library/Application Support/Heroic/tools/game-porting-toolkit/Game-Porting-Toolkit-latest/Contents/MacOS/wine",
+            NULL
+        };
+        for (int i = 0; fallbacks[i]; i++) {
+            if (snprintf(path, sizeof(path), fallbacks[i], home_dir()) >= (int)sizeof(path)) continue;
+            if (path_exists(path)) {
+                normalize_path_copy(out, out_len, path);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool is_crossover_prefix(const char *prefix) {
+    return path_has_component(prefix, "/CrossOver/Bottles/");
+}
+
+static bool is_crossover_cli_runner(const char *wine) {
+    return path_has_component(wine, "/CrossOver/bin/wine");
+}
+
+static bool is_crossover_runner(const char *wine) {
+    return is_crossover_cli_runner(wine) ||
+           path_has_component(wine, "/CrossOver-Hosted Application/wine");
+}
+
+static bool find_whisky_runner(const char *prefix, char *whisky_path, size_t whisky_len,
+                               char *bottle_name, size_t name_len) {
+    if (!prefix || !*prefix) return false;
+    if (!command_path("whisky", whisky_path, whisky_len)) {
+        const char *fallback = "/usr/local/bin/whisky";
+        if (!path_exists(fallback)) return false;
+        normalize_path_copy(whisky_path, whisky_len, fallback);
+    }
+
+    char target[PATH_MAX];
+    char resolved[PATH_MAX];
+    if (realpath(prefix, resolved)) normalize_path_copy(target, sizeof(target), resolved);
+    else normalize_path_copy(target, sizeof(target), prefix);
+
+    const char *list_cmd = strcmp(whisky_path, "/usr/local/bin/whisky") == 0
+        ? "/usr/local/bin/whisky list 2>/dev/null"
+        : "whisky list 2>/dev/null";
+    FILE *p = popen(list_cmd, "r");
+    if (!p) return false;
+
+    bool found = false;
+    char line[4096];
+    while (fgets(line, sizeof(line), p)) {
+        if (line[0] != '|') continue;
+
+        char *fields[4] = {0};
+        char *saveptr = NULL;
+        int field_count = 0;
+        for (char *part = strtok_r(line, "|", &saveptr);
+             part && field_count < 4;
+             part = strtok_r(NULL, "|", &saveptr)) {
+            fields[field_count++] = trim(part);
+        }
+
+        if (field_count < 3 || strcmp(fields[0], "Name") == 0 || strcmp(fields[2], "Path") == 0) continue;
+
+        char candidate[PATH_MAX];
+        char candidate_resolved[PATH_MAX];
+        normalize_path_copy(candidate, sizeof(candidate), fields[2]);
+        if (realpath(candidate, candidate_resolved)) {
+            normalize_path_copy(candidate, sizeof(candidate), candidate_resolved);
+        }
+
+        if (strcmp(candidate, target) == 0) {
+            snprintf(bottle_name, name_len, "%s", fields[0]);
+            found = bottle_name[0] != '\0';
+            break;
+        }
+    }
+    pclose(p);
+    return found;
+}
+
+static bool find_wine_runner(const Config *cfg, const char *prefix,
+                             const char *override_wine, char *out, size_t out_len) {
+    out[0] = '\0';
+
+    const char *env_wine = getenv("WINECORD_WINE");
+    const char *candidates[] = {
+        override_wine,
+        env_wine,
+        "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
+        cfg ? cfg->wine_path : NULL,
+        "/opt/homebrew/bin/wine64",
+        "/opt/homebrew/bin/wine",
+        "/usr/local/bin/wine64",
+        "/usr/local/bin/wine",
+        "/Applications/Wine Stable.app/Contents/Resources/wine/bin/wine64",
+        "/Applications/Wine Stable.app/Contents/Resources/wine/bin/wine",
+    };
+
+    size_t candidate_count = sizeof(candidates) / sizeof(candidates[0]);
+    for (size_t i = 0; i < candidate_count; i++) {
+        if (!candidates[i] || !*candidates[i]) continue;
+        if (i == 2 && !is_crossover_prefix(prefix)) continue;
+        if (!strchr(candidates[i], '/')) {
+            if (command_path(candidates[i], out, out_len)) return true;
+            continue;
+        }
+        if (path_exists(candidates[i])) {
+            normalize_path_copy(out, out_len, candidates[i]);
+            return true;
+        }
+    }
+
+    char candidate[PATH_MAX];
+    if (find_heroic_runner(prefix, candidate, sizeof(candidate))) {
+        normalize_path_copy(out, out_len, candidate);
+        return true;
+    }
+
+    snprintf(candidate, sizeof(candidate), "%s/Library/Application Support/com.isaacmarovitz.Whisky/Libraries/Wine/bin/wine64", home_dir());
+    if (path_exists(candidate)) {
+        normalize_path_copy(out, out_len, candidate);
+        return true;
+    }
+    snprintf(candidate, sizeof(candidate), "%s/Library/Application Support/com.franke.Whisky/Libraries/Wine/bin/wine64", home_dir());
+    if (path_exists(candidate)) {
+        normalize_path_copy(out, out_len, candidate);
+        return true;
+    }
+
+    const char *marker = strstr(prefix, ".app/Contents/SharedSupport/prefix");
+    if (!marker) marker = strstr(prefix, ".app/Contents/Resources");
+    if (marker) {
+        char app[PATH_MAX];
+        size_t app_len = (size_t)(marker - prefix) + strlen(".app");
+        if (app_len < sizeof(app)) {
+            memcpy(app, prefix, app_len);
+            app[app_len] = '\0';
+
+            const char *formats[] = {
+                "%s/Contents/Resources/wine/bin/wine64",
+                "%s/Contents/Resources/wine/bin/wine",
+                "%s/Contents/SharedSupport/wine/bin/wine64",
+                "%s/Contents/SharedSupport/wine/bin/wine",
+                "%s/Contents/Frameworks/wswine.bundle/bin/wine64",
+                "%s/Contents/Frameworks/wswine.bundle/bin/wine",
+                NULL
+            };
+            for (int i = 0; formats[i]; i++) {
+                snprintf(candidate, sizeof(candidate), formats[i], app);
+                if (path_exists(candidate)) {
+                    normalize_path_copy(out, out_len, candidate);
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (command_path("wine64", out, out_len)) return true;
+    if (command_path("wine", out, out_len)) return true;
+    return false;
+}
+
+static int run_whisky_helper(const char *prefix, const char *whisky_path, const char *bottle_name,
+                             const char *helper_path, const char *helper_arg, bool quiet) {
+    if (!path_exists(whisky_path) || !bottle_name || !*bottle_name) return 1;
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork failed: %s\n", strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        execl(whisky_path, "whisky", "run", bottle_name, helper_path, helper_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (!quiet) {
+            fprintf(stderr, "Whisky command failed through prefix %s (status %d).\n", prefix, status);
+            fprintf(stderr, "Manual command:\n  \"%s\" run \"%s\" \"%s\" %s\n",
+                    whisky_path, bottle_name, helper_path, helper_arg);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int run_crossover_helper(const char *bottle, const char *wine,
+                                const char *helper_path, const char *helper_arg, bool quiet) {
     if (!path_exists(wine)) {
         if (!quiet) printf("CrossOver wine wrapper not found: %s\n", wine);
         return quiet ? 0 : 1;
@@ -1447,7 +1938,11 @@ static int run_crossover_helper(const char *bottle, const char *helper_path, con
     }
     if (pid == 0) {
         setenv("CX_BOTTLE_PATH", bottle_parent, 1);
-        execl(wine, "wine", "--bottle", bottle_name, "--no-gui", helper_path, helper_arg, (char *)NULL);
+        if (is_crossover_cli_runner(wine)) {
+            execl(wine, "wine", "--bottle", bottle_name, "--no-gui", "--cx-app", helper_path, helper_arg, (char *)NULL);
+        } else {
+            execl(wine, "wine", "--bottle", bottle_name, "--no-gui", helper_path, helper_arg, (char *)NULL);
+        }
         _exit(127);
     }
 
@@ -1456,12 +1951,100 @@ static int run_crossover_helper(const char *bottle, const char *helper_path, con
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         if (!quiet) {
             fprintf(stderr, "CrossOver command failed through bottle %s (status %d).\n", bottle_name, status);
-            fprintf(stderr, "Manual command:\n  CX_BOTTLE_PATH=\"%s\" \"%s\" --bottle \"%s\" --no-gui \"%s\" %s\n",
-                    bottle_parent, wine, bottle_name, helper_path, helper_arg);
+            if (is_crossover_cli_runner(wine)) {
+                fprintf(stderr, "Manual command:\n  CX_BOTTLE_PATH=\"%s\" \"%s\" --bottle \"%s\" --no-gui --cx-app \"%s\" %s\n",
+                        bottle_parent, wine, bottle_name, helper_path, helper_arg);
+            } else {
+                fprintf(stderr, "Manual command:\n  CX_BOTTLE_PATH=\"%s\" \"%s\" --bottle \"%s\" --no-gui \"%s\" %s\n",
+                        bottle_parent, wine, bottle_name, helper_path, helper_arg);
+            }
         }
         return 1;
     }
     return 0;
+}
+
+static int run_generic_wine_helper(const char *prefix, const char *wine,
+                                   const char *helper_path, const char *helper_arg, bool quiet) {
+    if (!path_exists(wine)) {
+        if (!quiet) fprintf(stderr, "Wine runner not found: %s\n", wine);
+        return quiet ? 0 : 1;
+    }
+
+    char wine_dir[PATH_MAX];
+    parent_dir(wine, wine_dir, sizeof(wine_dir));
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork failed: %s\n", strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        const char *old_path = getenv("PATH");
+        char new_path[PATH_MAX * 2];
+        snprintf(new_path, sizeof(new_path), "%s:%s", wine_dir, old_path ? old_path : "/usr/bin:/bin:/usr/sbin:/sbin");
+        setenv("PATH", new_path, 1);
+
+        char wine_root[PATH_MAX];
+        char wine_lib[PATH_MAX];
+        parent_dir(wine_dir, wine_root, sizeof(wine_root));
+        snprintf(wine_lib, sizeof(wine_lib), "%s/lib", wine_root);
+        if (is_directory(wine_lib)) {
+            const char *old_dyld = getenv("DYLD_FALLBACK_LIBRARY_PATH");
+            char new_dyld[PATH_MAX * 2];
+            snprintf(new_dyld, sizeof(new_dyld), "%s:%s", wine_lib,
+                     old_dyld ? old_dyld : "/usr/lib");
+            setenv("DYLD_FALLBACK_LIBRARY_PATH", new_dyld, 1);
+        }
+
+        setenv("WINE", base_name(wine), 1);
+        setenv("WINEPREFIX", prefix, 1);
+        chdir(wine_dir);
+        execl(wine, base_name(wine), helper_path, helper_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (!quiet) {
+            fprintf(stderr, "Wine command failed through prefix %s (status %d).\n", prefix, status);
+            fprintf(stderr, "Manual command:\n  WINEPREFIX=\"%s\" \"%s\" \"%s\" %s\n",
+                    prefix, wine, helper_path, helper_arg);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int run_prefix_helper(const Config *cfg, const char *prefix, const char *wine_override,
+                             const char *helper_path, const char *helper_arg, bool quiet,
+                             char *used_wine, size_t used_wine_len) {
+    const char *env_wine = getenv("WINECORD_WINE");
+    if ((!wine_override || !*wine_override) && (!env_wine || !*env_wine)) {
+        char whisky_path[PATH_MAX];
+        char bottle_name[256];
+        if (find_whisky_runner(prefix, whisky_path, sizeof(whisky_path), bottle_name, sizeof(bottle_name))) {
+            if (used_wine && used_wine_len > 0) snprintf(used_wine, used_wine_len, "whisky:%s", bottle_name);
+            if (run_whisky_helper(prefix, whisky_path, bottle_name, helper_path, helper_arg, quiet) == 0) {
+                return 0;
+            }
+        }
+    }
+
+    char wine[PATH_MAX];
+    if (!find_wine_runner(cfg, prefix, wine_override, wine, sizeof(wine))) {
+        if (!quiet) {
+            fprintf(stderr, "No Wine runner found for prefix: %s\n", prefix);
+            fprintf(stderr, "Pass --wine /path/to/wine or set WINECORD_WINE.\n");
+        }
+        return 1;
+    }
+    if (used_wine && used_wine_len > 0) snprintf(used_wine, used_wine_len, "%s", wine);
+    if (is_crossover_runner(wine)) return run_crossover_helper(prefix, wine, helper_path, helper_arg, quiet);
+    return run_generic_wine_helper(prefix, wine, helper_path, helper_arg, quiet);
 }
 
 static int write_bottle_config(const Config *cfg, const char *bottle) {
@@ -1482,49 +2065,88 @@ static int write_bottle_config(const Config *cfg, const char *bottle) {
     fprintf(f, "host=%s\nport=%d\ntoken=%s\n", cfg->host, cfg->port, cfg->token);
     fclose(f);
     chmod(path, 0644);
-    printf("Wrote bottle config: %s\n", path);
+    printf("Wrote prefix config: %s\n", path);
     return 0;
 }
 
-static int register_windows_service(const char *bottle, const char *helper_dest) {
-    if (run_crossover_helper(bottle, helper_dest, "--install", false) != 0) return 1;
-    printf("Registered WineCordBridge service in bottle: %s\n", base_name(bottle));
+static int register_windows_service(const Config *cfg, const char *prefix,
+                                    const char *wine, const char *helper_dest,
+                                    char *used_wine, size_t used_wine_len) {
+    if (run_prefix_helper(cfg, prefix, wine, helper_dest, "--install", false,
+                          used_wine, used_wine_len) != 0) {
+        return 1;
+    }
+    printf("Registered WineCordBridge service in prefix: %s\n", prefix);
+    return 0;
+}
+
+static int install_one_prefix(Config *cfg, const char *prefix, const char *helper,
+                              const char *wine, bool no_register, bool required) {
+    if (!prefix || !is_wine_prefix(prefix)) {
+        if (required) fprintf(stderr, "Wine prefix not found or not initialized: %s\n", prefix ? prefix : "<none>");
+        return 1;
+    }
+
+    if (!no_register) {
+        const char *env_wine = getenv("WINECORD_WINE");
+        char runner[PATH_MAX];
+        char whisky_path[PATH_MAX];
+        char whisky_name[256];
+        bool has_runner = find_wine_runner(cfg, prefix, wine, runner, sizeof(runner));
+        if (!has_runner && (!wine || !*wine) && (!env_wine || !*env_wine)) {
+            has_runner = find_whisky_runner(prefix, whisky_path, sizeof(whisky_path), whisky_name, sizeof(whisky_name));
+        }
+        if (!has_runner) {
+            fprintf(stderr, "Skipping prefix without a usable Wine runner: %s\n", prefix);
+            fprintf(stderr, "Pass --wine /path/to/wine if this prefix uses a custom runner.\n");
+            return 1;
+        }
+    }
+
+    char helper_dest[PATH_MAX];
+    snprintf(helper_dest, sizeof(helper_dest), "%s/drive_c/windows/winecord-bridge.exe", prefix);
+
+    if (write_bottle_config(cfg, prefix) != 0) return 1;
+    if (copy_file(helper, helper_dest, 0755) != 0) return 1;
+    printf("Installed helper: %s\n", helper_dest);
+
+    char used_wine[PATH_MAX] = "";
+    if (!no_register) {
+        if (register_windows_service(cfg, prefix, wine, helper_dest, used_wine, sizeof(used_wine)) != 0) {
+            return 1;
+        }
+    } else {
+        find_wine_runner(cfg, prefix, wine, used_wine, sizeof(used_wine));
+        printf("Skipped service registration (--no-register).\n");
+    }
+
+    remember_bottle(cfg, prefix);
+    if (used_wine[0] && path_exists(used_wine) && !is_crossover_runner(used_wine)) {
+        normalize_path_copy(cfg->wine_path, sizeof(cfg->wine_path), used_wine);
+    }
+    if (save_config(cfg) != 0) return 1;
     return 0;
 }
 
 static int install_bottle(Config *cfg, int argc, char **argv) {
-    const char *bottle = NULL;
+    char explicit_prefix[PATH_MAX] = "";
+    const char *wine = NULL;
     const char *helper = NULL;
     bool no_register = false;
 
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--bottle") == 0 && i + 1 < argc) {
-            bottle = argv[++i];
+        if ((strcmp(argv[i], "--bottle") == 0 || strcmp(argv[i], "--prefix") == 0) && i + 1 < argc) {
+            normalize_path_copy(explicit_prefix, sizeof(explicit_prefix), argv[++i]);
+        } else if (strcmp(argv[i], "--wine") == 0 && i + 1 < argc) {
+            wine = argv[++i];
         } else if (strcmp(argv[i], "--helper") == 0 && i + 1 < argc) {
             helper = argv[++i];
         } else if (strcmp(argv[i], "--no-register") == 0) {
             no_register = true;
         } else {
-            fprintf(stderr, "Unknown install-bottle option: %s\n", argv[i]);
+            fprintf(stderr, "Unknown setup option: %s\n", argv[i]);
             return 1;
         }
-    }
-
-    char discovered[PATH_MAX];
-    if (!bottle) {
-        discover_steam_bottle(discovered, sizeof(discovered));
-        bottle = discovered[0] ? discovered : NULL;
-    }
-    if (!bottle || !is_directory(bottle)) {
-        fprintf(stderr, "Bottle not found. Pass --bottle /path/to/Bottles/Steam\n");
-        return 1;
-    }
-
-    char drive_c[PATH_MAX];
-    snprintf(drive_c, sizeof(drive_c), "%s/drive_c", bottle);
-    if (!is_directory(drive_c)) {
-        fprintf(stderr, "This does not look like a Wine/CrossOver bottle: %s\n", bottle);
-        return 1;
     }
 
     char helper_found[PATH_MAX];
@@ -1540,18 +2162,40 @@ static int install_bottle(Config *cfg, int argc, char **argv) {
         return 1;
     }
 
-    remember_bottle(cfg, bottle);
-    if (save_config(cfg) != 0) return 1;
+    char prefixes[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int prefix_count = 0;
+    if (explicit_prefix[0]) {
+        add_prefix_candidate(prefixes, &prefix_count, explicit_prefix);
+        if (prefix_count == 0) {
+            fprintf(stderr, "This does not look like an initialized Wine prefix: %s\n", explicit_prefix);
+            return 1;
+        }
+    } else {
+        prefix_count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
+    }
 
-    if (write_bottle_config(cfg, bottle) != 0) return 1;
+    if (prefix_count == 0) {
+        fprintf(stderr,
+                "No Wine prefix found. Open your Wine app once, or pass --prefix /path/to/prefix.\n");
+        return 1;
+    }
 
-    char helper_dest[PATH_MAX];
-    snprintf(helper_dest, sizeof(helper_dest), "%s/drive_c/windows/winecord-bridge.exe", bottle);
-    if (copy_file(helper, helper_dest, 0755) != 0) return 1;
-    printf("Installed helper: %s\n", helper_dest);
+    int installed = 0;
+    int failed = 0;
+    for (int i = 0; i < prefix_count; i++) {
+        printf("\nConfiguring Wine prefix: %s\n", prefixes[i]);
+        if (install_one_prefix(cfg, prefixes[i], helper, wine, no_register, explicit_prefix[0] != '\0') == 0) {
+            installed++;
+        } else {
+            failed++;
+            if (explicit_prefix[0]) return 1;
+        }
+    }
 
-    if (!no_register) return register_windows_service(bottle, helper_dest);
-    printf("Skipped service registration (--no-register).\n");
+    if (installed == 0) return 1;
+    if (failed > 0) {
+        fprintf(stderr, "\nWineCord configured %d prefix(es), but skipped %d prefix(es) with errors.\n", installed, failed);
+    }
     return 0;
 }
 
@@ -1576,8 +2220,8 @@ static bool remove_dir_if_empty(const char *path) {
     return false;
 }
 
-static int remove_bottle_setup(const char *bottle) {
-    if (!bottle || !is_directory(bottle)) return 1;
+static int remove_bottle_setup(const Config *cfg, const char *bottle, const char *wine) {
+    if (!bottle || !is_wine_prefix(bottle)) return 1;
     int failures = 0;
 
     char helper_dest[PATH_MAX];
@@ -1589,12 +2233,12 @@ static int remove_bottle_setup(const char *bottle) {
     }
 
     if (helper_runner[0]) {
-        if (run_crossover_helper(bottle, helper_runner, "--remove", false) != 0) {
-            fprintf(stderr, "Could not remove the WineCordBridge service from bottle: %s\n", bottle);
+        if (run_prefix_helper(cfg, bottle, wine, helper_runner, "--remove", false, NULL, 0) != 0) {
+            fprintf(stderr, "Could not remove the WineCordBridge service from prefix: %s\n", bottle);
             failures++;
         }
     } else {
-        fprintf(stderr, "Could not find winecord-bridge.exe to remove the Wine service in bottle: %s\n", bottle);
+        fprintf(stderr, "Could not find winecord-bridge.exe to remove the Wine service in prefix: %s\n", bottle);
         failures++;
     }
 
@@ -1612,7 +2256,7 @@ static int remove_bottle_setup(const char *bottle) {
     snprintf(dir, sizeof(dir), "%s/drive_c/users/Public/WineCord", bottle);
     if (!remove_dir_if_empty(dir)) failures++;
 
-    if (failures == 0) printf("Cleaned bottle: %s\n", bottle);
+    if (failures == 0) printf("Cleaned prefix: %s\n", bottle);
     return failures == 0 ? 0 : 1;
 }
 
@@ -1621,25 +2265,28 @@ static int setup_all(Config *cfg, int argc, char **argv) {
     fflush(stdout);
     if (install_agent(cfg) != 0) return 1;
     if (install_bottle(cfg, argc, argv) != 0) return 1;
-    printf("\nDone. Keep Discord for macOS open, then launch the Windows game from CrossOver.\n");
+    printf("\nDone. Keep Discord for macOS open, then launch the Windows game from your Wine app.\n");
     return 0;
 }
 
 static int uninstall_all(const Config *cfg, int argc, char **argv) {
     char bottle_targets[MAX_TRACKED_BOTTLES][PATH_MAX];
     int bottle_target_count = 0;
+    const char *wine = NULL;
     bool keep_config = false;
     bool keep_logs = false;
     bool skip_bottle = false;
 
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--bottle") == 0 && i + 1 < argc) {
+        if ((strcmp(argv[i], "--bottle") == 0 || strcmp(argv[i], "--prefix") == 0) && i + 1 < argc) {
             add_path_target(bottle_targets, &bottle_target_count, argv[++i]);
+        } else if (strcmp(argv[i], "--wine") == 0 && i + 1 < argc) {
+            wine = argv[++i];
         } else if (strcmp(argv[i], "--keep-config") == 0) {
             keep_config = true;
         } else if (strcmp(argv[i], "--keep-logs") == 0) {
             keep_logs = true;
-        } else if (strcmp(argv[i], "--no-bottle") == 0) {
+        } else if (strcmp(argv[i], "--no-bottle") == 0 || strcmp(argv[i], "--no-prefix") == 0) {
             skip_bottle = true;
         } else {
             fprintf(stderr, "Unknown uninstall option: %s\n", argv[i]);
@@ -1658,28 +2305,30 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
             }
 
             if (bottle_target_count == 0) {
-                char discovered[PATH_MAX];
-                discover_steam_bottle(discovered, sizeof(discovered));
-                if (discovered[0]) add_path_target(bottle_targets, &bottle_target_count, discovered);
+                char discovered[MAX_TRACKED_BOTTLES][PATH_MAX];
+                int discovered_count = discover_wine_prefixes(cfg, discovered, MAX_TRACKED_BOTTLES);
+                for (int i = 0; i < discovered_count; i++) {
+                    add_path_target(bottle_targets, &bottle_target_count, discovered[i]);
+                }
             }
         }
 
         if (bottle_target_count == 0) {
-            printf("No CrossOver bottle recorded or discovered; skipped bottle cleanup.\n");
+            printf("No Wine prefix recorded or discovered; skipped prefix cleanup.\n");
         }
 
         for (int i = 0; i < bottle_target_count; i++) {
             const char *target = bottle_targets[i];
-            if (!is_directory(target)) {
+            if (!is_wine_prefix(target)) {
                 fprintf(stderr,
-                        "Could not access the configured CrossOver bottle:\n"
+                        "Could not access the configured Wine prefix:\n"
                         "  %s\n"
-                        "If this bottle is on an external volume, connect that volume and run `winecord uninstall` again.\n",
+                        "If this prefix is on an external volume, connect that volume and run `winecord uninstall` again.\n",
                         target);
                 bottle_failures++;
                 continue;
             }
-            if (remove_bottle_setup(target) != 0) bottle_failures++;
+            if (remove_bottle_setup(cfg, target, wine) != 0) bottle_failures++;
         }
     }
 
@@ -1690,7 +2339,7 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
         keep_logs = true;
         fprintf(stderr,
                 "\nWineCord uninstall is incomplete. Kept local config and logs so the remaining bottle cleanup can be retried.\n"
-                "Reconnect any external volume that contains a CrossOver bottle, then run `winecord uninstall` again.\n");
+                "Reconnect any external volume that contains a Wine prefix, then run `winecord uninstall` again.\n");
     }
 
     if (!keep_config) {
@@ -1721,17 +2370,18 @@ static void usage(FILE *out) {
             "WineCord %s\n"
             "Created by Zard Studios. Copyright (c) 2026 Zard Studios.\n\n"
             "Usage:\n"
-            "  winecord setup [--bottle PATH] [--helper PATH] [--no-register]\n"
-            "  winecord uninstall [--bottle PATH] [--keep-config] [--keep-logs] [--no-bottle]\n"
+            "  winecord setup [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
+            "  winecord uninstall [--prefix PATH] [--wine PATH] [--keep-config] [--keep-logs] [--no-prefix]\n"
             "  winecord agent\n"
             "  winecord doctor\n"
             "  winecord clear [--client-id ID] [--pid PID]\n"
-            "  winecord logs [--follow] [--bottle PATH]\n"
+            "  winecord logs [--follow] [--prefix PATH]\n"
             "  winecord install-agent\n"
             "  winecord uninstall-agent\n"
             "  winecord start\n"
             "  winecord stop\n"
-            "  winecord install-bottle [--bottle PATH] [--helper PATH] [--no-register]\n"
+            "  winecord install-bottle [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
+            "  winecord install-prefix [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
             "  winecord --version\n",
             WINECORD_VERSION);
 }
@@ -1761,7 +2411,9 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "uninstall-agent") == 0) return uninstall_agent();
     if (strcmp(cmd, "start") == 0) return start_agent(&cfg);
     if (strcmp(cmd, "stop") == 0) return stop_agent();
-    if (strcmp(cmd, "install-bottle") == 0) return install_bottle(&cfg, argc - 2, argv + 2);
+    if (strcmp(cmd, "install-bottle") == 0 || strcmp(cmd, "install-prefix") == 0) {
+        return install_bottle(&cfg, argc - 2, argv + 2);
+    }
     if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "help") == 0) {
         usage(stdout);
         return 0;

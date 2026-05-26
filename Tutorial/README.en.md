@@ -9,49 +9,63 @@ brew install zard-studios/tap/winecord
 winecord setup
 ```
 
-This is the normal setup. `winecord setup` detects the CrossOver Steam bottle,
-installs the macOS agent, copies the Windows bridge into the bottle, writes the
-local configuration, and registers the Wine service.
+That is the normal flow. `winecord setup` installs the macOS LaunchAgent,
+finds common Wine prefixes automatically, copies the Windows bridge into each
+configured prefix, writes the local connection file, and registers the Wine
+service.
 
-After setup, keep Discord for macOS open and launch the Windows game from
-CrossOver or from Steam inside CrossOver.
+Keep Discord for macOS open, then launch the Windows game from your Wine app.
 
-## 🍾 If the bottle is not detected
+## 🧭 Automatic Detection
 
-Use this command when your Steam bottle is stored in a custom location:
+WineCord looks for initialized prefixes in the common macOS locations used by
+CrossOver, Whisky, Wineskin wrappers, Heroic, regular Wine, and `~/.wine`.
+
+For Whisky, installing WhiskyCmd from `Whisky > Install Whisky CLI...` gives
+WineCord the cleanest way to run the helper inside a registered Whisky bottle.
+If WhiskyCmd is not available, WineCord still tries the bundled Wine runner.
+
+## 🧩 Manual Setup
+
+Use a manual prefix only when auto-detection misses your app. A prefix is the
+folder that contains `drive_c`.
+
+```sh
+winecord setup --prefix "/path/to/prefix"
+```
+
+If that prefix needs a specific Wine binary:
+
+```sh
+winecord setup --prefix "/path/to/prefix" --wine "/path/to/wine"
+```
+
+The older CrossOver-style flag is still accepted:
 
 ```sh
 winecord setup --bottle "/path/to/CrossOver/Bottles/Steam"
 ```
 
-For multiple bottles, run setup once per bottle:
-
-```sh
-winecord setup --bottle "/path/to/CrossOver/Bottles/GameBottle"
-```
-
-## 🧪 Check or debug
+## 🧪 Check Or Debug
 
 ```sh
 winecord doctor
 winecord logs --follow
 ```
 
-`winecord doctor` checks the local Discord socket, WineCord configuration,
-CrossOver detection, installed helper, and LaunchAgent path.
+`winecord doctor` checks Discord IPC, the LaunchAgent, detected prefixes, the
+Wine runner, and the installed helper.
 
 `winecord logs --follow` shows live bridge activity. When a game opens Discord
 IPC, you will see the pipe connection and the first IPC frame. If a game only
-uses Steam Rich Presence or Discord game detection, WineCord may have nothing to
-forward.
+uses Steam Rich Presence or Discord game detection, WineCord may have nothing
+to forward yet.
 
-If Discord keeps showing a game after it has closed, run:
+If Discord keeps showing a game after it closes:
 
 ```sh
 winecord clear
 ```
-
-This asks Discord to clear the last activity WineCord saw.
 
 ## 🧹 Uninstall
 
@@ -60,36 +74,14 @@ winecord uninstall
 brew uninstall winecord
 ```
 
-Run `winecord uninstall` first so WineCord can remove the LaunchAgent, Wine
-service, helper, configuration, and logs while the CLI is still installed.
+Run `winecord uninstall` first. It removes the LaunchAgent, Wine service,
+helper, prefix configuration, and WineCord logs while the CLI is still
+installed.
 
-If your CrossOver bottle is on an external drive, connect that drive before
-uninstalling. When WineCord cannot access a bottle it previously configured, it
+If a configured prefix is on an external drive, connect that drive before
+uninstalling. When WineCord cannot access a prefix it previously configured, it
 keeps the local config and logs, warns you, and asks you to run `winecord
 uninstall` again after the drive is mounted.
-
-## 🛠 Maintainer notes
-
-Build and package:
-
-```sh
-make
-make windows-helper
-make package
-```
-
-Useful local smoke test:
-
-```sh
-make windows-smoke
-CX_BOTTLE_PATH="/path/to/CrossOver/Bottles" \
-  "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine" \
-  --bottle Steam --no-gui ./build/pipe-smoke.exe
-```
-
-The expected response for the bundled smoke test is Discord's `Invalid Client
-ID` close frame. That is good: it proves bytes traveled through the Windows
-named pipe, the Wine helper, the macOS agent, and Discord.
 
 ## 📁 Paths
 
@@ -105,3 +97,15 @@ Logs:
 ~/Library/Logs/WineCord/
 drive_c/users/Public/WineCord/bridge.log
 ```
+
+## 🛠 Maintainers
+
+```sh
+make
+make windows-helper
+make package
+```
+
+The bundled smoke test expects Discord's `Invalid Client ID` close frame. That
+is useful: it proves bytes traveled through the Windows named pipe, the Wine
+helper, the macOS agent, and Discord.
