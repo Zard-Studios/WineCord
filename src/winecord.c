@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -29,7 +30,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.12"
+#define WINECORD_VERSION "0.1.13"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -1306,6 +1307,63 @@ static bool steam_app_name(const char *steam_root, const char *appid,
     return found;
 }
 
+static bool steam_cache_icon_hash(const char *filename, char *out, size_t out_len) {
+    if (!filename || !out || out_len < 41) return false;
+
+    size_t hash_len = 0;
+    size_t len = strlen(filename);
+    if (len == 40) {
+        hash_len = 40;
+    } else if (len == 44 &&
+               filename[40] == '.' &&
+               tolower((unsigned char)filename[41]) == 'j' &&
+               tolower((unsigned char)filename[42]) == 'p' &&
+               tolower((unsigned char)filename[43]) == 'g') {
+        hash_len = 40;
+    } else {
+        return false;
+    }
+
+    for (size_t i = 0; i < hash_len; i++) {
+        if (!isxdigit((unsigned char)filename[i])) return false;
+    }
+
+    memcpy(out, filename, hash_len);
+    out[hash_len] = '\0';
+    return true;
+}
+
+static bool steam_app_icon_url(const char *steam_root, const char *appid,
+                               char *out, size_t out_len) {
+    if (!steam_root || !appid || !out || out_len == 0) return false;
+    out[0] = '\0';
+
+    char cache_dir[PATH_MAX];
+    if (snprintf(cache_dir, sizeof(cache_dir), "%s/appcache/librarycache/%s",
+                 steam_root, appid) >= (int)sizeof(cache_dir)) {
+        return false;
+    }
+
+    DIR *dir = opendir(cache_dir);
+    if (!dir) return false;
+
+    bool found = false;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        char hash[41];
+        if (!steam_cache_icon_hash(entry->d_name, hash, sizeof(hash))) continue;
+
+        snprintf(out, out_len,
+                 "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/%s/%s.jpg",
+                 appid, hash);
+        found = true;
+        break;
+    }
+
+    closedir(dir);
+    return found;
+}
+
 static int collect_steam_activity_for_prefix(const char *prefix,
                                              SteamActivityCounter games[],
                                              int max_games,
@@ -1471,20 +1529,28 @@ static int send_fallback_activity(int fd, const SteamActivity *game, time_t star
     char name_json[512];
     json_escape_string(game->name[0] ? game->name : "Steam game", name_json, sizeof(name_json));
 
-    char image_url[256];
-    snprintf(image_url, sizeof(image_url),
-             "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/header.jpg",
-             game->appid);
+    char image_url[512];
+    char steam_root[PATH_MAX] = "";
+    if (!steam_root_for_prefix(game->prefix, steam_root, sizeof(steam_root)) ||
+        !steam_app_icon_url(steam_root, game->appid, image_url, sizeof(image_url))) {
+        snprintf(image_url, sizeof(image_url),
+                 "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/header.jpg",
+                 game->appid);
+    }
 
     char json[2048];
     snprintf(json, sizeof(json),
              "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%ld,\"activity\":{"
+             "\"name\":\"%s\","
+             "\"type\":0,"
+             "\"status_display_type\":2,"
              "\"details\":\"%s\","
              "\"state\":\"Steam game through Wine\","
              "\"timestamps\":{\"start\":%ld},"
              "\"assets\":{\"large_image\":\"%s\",\"large_text\":\"%s\"}"
              "}},\"nonce\":\"winecord-fallback-%s-%ld\"}",
              (long)getpid(),
+             name_json,
              name_json,
              (long)started_at,
              image_url,

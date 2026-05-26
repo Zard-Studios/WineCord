@@ -2,7 +2,7 @@
 set -eu
 
 TAP_DIR="${1:-../homebrew-tap}"
-VERSION="${VERSION:-0.1.12}"
+VERSION="${VERSION:-0.1.13}"
 
 if [ ! -f "Formula/winecord.rb" ]; then
   echo "Run this from the WineCord repository root." >&2
@@ -14,6 +14,8 @@ if [ ! -f "dist/winecord-${VERSION}-macos-universal.tar.gz" ]; then
   exit 1
 fi
 
+SHA256="$(shasum -a 256 "dist/winecord-${VERSION}-macos-universal.tar.gz" | awk '{print $1}')"
+
 mkdir -p "$TAP_DIR/Formula"
 mkdir -p "$TAP_DIR/releases"
 
@@ -23,6 +25,8 @@ fi
 
 cp Formula/winecord.rb "$TAP_DIR/Formula/winecord.rb"
 cp "dist/winecord-${VERSION}-macos-universal.tar.gz" "$TAP_DIR/releases/"
+
+perl -0pi -e "s|releases/winecord-[^\"]+-macos-universal\\.tar\\.gz|releases/winecord-${VERSION}-macos-universal.tar.gz|g; s|sha256 \"[0-9a-f]{64}\"|sha256 \"${SHA256}\"|g" "$TAP_DIR/Formula/winecord.rb"
 
 (
   cd "$TAP_DIR"
