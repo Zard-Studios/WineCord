@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,7 +29,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.9"
+#define WINECORD_VERSION "0.1.10"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
@@ -89,6 +90,57 @@ static char *trim(char *s) {
     char *end = s + strlen(s) - 1;
     while (end > s && isspace((unsigned char)*end)) *end-- = '\0';
     return s;
+}
+
+static bool color_enabled(FILE *stream) {
+    const char *no_color = getenv("NO_COLOR");
+    const char *wc_no_color = getenv("WINECORD_NO_COLOR");
+    const char *term = getenv("TERM");
+    if ((no_color && *no_color) || (wc_no_color && *wc_no_color)) return false;
+    if (term && strcmp(term, "dumb") == 0) return false;
+    return stream && isatty(fileno(stream));
+}
+
+static void styled_printf(FILE *stream, const char *style, const char *fmt, ...) {
+    va_list args;
+    if (style && color_enabled(stream)) fputs(style, stream);
+    va_start(args, fmt);
+    vfprintf(stream, fmt, args);
+    va_end(args);
+    if (style && color_enabled(stream)) fputs("\033[0m", stream);
+}
+
+static void print_header(const char *text) {
+    styled_printf(stdout, "\033[1;36m", "\n==> %s\n", text);
+}
+
+static void print_success(const char *fmt, ...) {
+    if (color_enabled(stdout)) fputs("\033[32m", stdout);
+    fputs("✓ ", stdout);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+    if (color_enabled(stdout)) fputs("\033[0m", stdout);
+}
+
+static void print_note(const char *fmt, ...) {
+    if (color_enabled(stdout)) fputs("\033[2m", stdout);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+    if (color_enabled(stdout)) fputs("\033[0m", stdout);
+}
+
+static void print_warning_stdout(const char *fmt, ...) {
+    if (color_enabled(stdout)) fputs("\033[33m", stdout);
+    fputs("Warning: ", stdout);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+    if (color_enabled(stdout)) fputs("\033[0m", stdout);
 }
 
 static bool path_exists(const char *path) {
@@ -1392,7 +1444,8 @@ static int install_agent(const Config *cfg) {
     snprintf(cmd, sizeof(cmd), "launchctl kickstart -k gui/%d/%s 2>/dev/null || true", getuid(), WINECORD_LABEL);
     system(cmd);
 
-    printf("Installed LaunchAgent: %s\n", plist);
+    print_success("Installed LaunchAgent\n");
+    print_note("  %s\n", plist);
     return 0;
 }
 
@@ -1408,7 +1461,8 @@ static int uninstall_agent(void) {
         fprintf(stderr, "Could not remove %s: %s\n", plist, strerror(errno));
         return 1;
     }
-    printf("Removed LaunchAgent: %s\n", plist);
+    print_success("Removed LaunchAgent\n");
+    print_note("  %s\n", plist);
     return 0;
 }
 
@@ -2100,7 +2154,8 @@ static int write_bottle_config(const Config *cfg, const char *bottle) {
     fprintf(f, "host=%s\nport=%d\ntoken=%s\n", cfg->host, cfg->port, cfg->token);
     fclose(f);
     chmod(path, 0644);
-    printf("Wrote prefix config: %s\n", path);
+    print_success("Wrote prefix config\n");
+    print_note("  %s\n", path);
     return 0;
 }
 
@@ -2111,7 +2166,8 @@ static int register_windows_service(const Config *cfg, const char *prefix,
                           used_wine, used_wine_len) != 0) {
         return 1;
     }
-    printf("Registered WineCordBridge service in prefix: %s\n", prefix);
+    print_success("Registered WineCordBridge service\n");
+    print_note("  %s\n", prefix);
     return 0;
 }
 
@@ -2137,7 +2193,8 @@ static int install_one_prefix(Config *cfg, const char *prefix, const char *helpe
                 fprintf(stderr, "Pass --wine /path/to/wine if this prefix uses a custom runner.\n");
                 return 1;
             }
-            printf("Skipped prefix without a usable Wine runner: %s\n", prefix);
+            print_warning_stdout("Skipped prefix without a usable Wine runner\n");
+            print_note("  %s\n", prefix);
             return 2;
         }
     }
@@ -2147,7 +2204,8 @@ static int install_one_prefix(Config *cfg, const char *prefix, const char *helpe
 
     if (write_bottle_config(cfg, prefix) != 0) return 1;
     if (copy_file(helper, helper_dest, 0755) != 0) return 1;
-    printf("Installed helper: %s\n", helper_dest);
+    print_success("Installed helper\n");
+    print_note("  %s\n", helper_dest);
 
     char used_wine[PATH_MAX] = "";
     if (!no_register) {
@@ -2156,7 +2214,7 @@ static int install_one_prefix(Config *cfg, const char *prefix, const char *helpe
         }
     } else {
         find_wine_runner(cfg, prefix, wine, used_wine, sizeof(used_wine));
-        printf("Skipped service registration (--no-register).\n");
+        print_warning_stdout("Skipped service registration (--no-register).\n");
     }
 
     remember_bottle(cfg, prefix);
@@ -2223,7 +2281,8 @@ static int install_bottle(Config *cfg, int argc, char **argv) {
     int skipped = 0;
     int failed = 0;
     for (int i = 0; i < prefix_count; i++) {
-        printf("\nConfiguring Wine prefix: %s\n", prefixes[i]);
+        print_header("Configuring Wine prefix");
+        print_note("  %s\n", prefixes[i]);
         int result = install_one_prefix(cfg, prefixes[i], helper, wine, no_register, explicit_prefix[0] != '\0');
         if (result == 0) {
             installed++;
@@ -2237,8 +2296,8 @@ static int install_bottle(Config *cfg, int argc, char **argv) {
 
     if (installed == 0) return 1;
     if (skipped > 0) {
-        printf("\nWineCord configured %d prefix(es) and skipped %d prefix(es) without a usable runner.\n",
-               installed, skipped);
+        print_warning_stdout("WineCord configured %d prefix(es) and skipped %d prefix(es) without a usable runner.\n",
+                             installed, skipped);
     }
     if (failed > 0) {
         fprintf(stderr, "\nWineCord configured %d prefix(es), but skipped %d prefix(es) with errors.\n", installed, failed);
@@ -2248,7 +2307,8 @@ static int install_bottle(Config *cfg, int argc, char **argv) {
 
 static bool remove_file_if_exists(const char *path) {
     if (unlink(path) == 0) {
-        printf("Removed: %s\n", path);
+        print_success("Removed\n");
+        print_note("  %s\n", path);
         return true;
     } else if (errno != ENOENT) {
         fprintf(stderr, "Could not remove %s: %s\n", path, strerror(errno));
@@ -2259,7 +2319,8 @@ static bool remove_file_if_exists(const char *path) {
 
 static bool remove_dir_if_empty(const char *path) {
     if (rmdir(path) == 0) {
-        printf("Removed: %s\n", path);
+        print_success("Removed\n");
+        print_note("  %s\n", path);
         return true;
     }
     if (errno == ENOENT) return true;
@@ -2305,16 +2366,19 @@ static int remove_bottle_setup(const Config *cfg, const char *bottle, const char
     snprintf(dir, sizeof(dir), "%s/drive_c/users/Public/WineCord", bottle);
     if (!remove_dir_if_empty(dir)) failures++;
 
-    if (failures == 0) printf("Cleaned prefix: %s\n", bottle);
+    if (failures == 0) {
+        print_success("Cleaned prefix\n");
+        print_note("  %s\n", bottle);
+    }
     return failures == 0 ? 0 : 1;
 }
 
 static int setup_all(Config *cfg, int argc, char **argv) {
-    printf("Setting up WineCord...\n");
+    print_header("Setting up WineCord");
     fflush(stdout);
     if (install_agent(cfg) != 0) return 1;
     if (install_bottle(cfg, argc, argv) != 0) return 1;
-    printf("\nDone. Keep Discord for macOS open, then launch the Windows game from your Wine app.\n");
+    print_success("Done. Keep Discord for macOS open, then launch the Windows game from your Wine app.\n");
     return 0;
 }
 
@@ -2343,7 +2407,7 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
         }
     }
 
-    printf("Uninstalling WineCord setup...\n");
+    print_header("Uninstalling WineCord setup");
     fflush(stdout);
 
     int bottle_failures = 0;
@@ -2363,7 +2427,7 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
         }
 
         if (bottle_target_count == 0) {
-            printf("No Wine prefix recorded or discovered; skipped prefix cleanup.\n");
+            print_warning_stdout("No Wine prefix recorded or discovered; skipped prefix cleanup.\n");
         }
 
         for (int i = 0; i < bottle_target_count; i++) {
@@ -2410,7 +2474,7 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
 
     if (bottle_failures > 0) return 1;
 
-    printf("\nWineCord setup removed. You can now run `brew uninstall winecord` to remove the package.\n");
+    print_success("WineCord setup removed. You can now run `brew uninstall winecord` to remove the package.\n");
     return 0;
 }
 
@@ -2533,14 +2597,14 @@ static void maybe_print_update_notice(const Config *cfg, const char *cmd) {
     }
 
     if (version_compare(latest, WINECORD_VERSION) > 0) {
-        fprintf(stderr,
-                "\033[33mWARNING: You are using WineCord version %s; however, version %s is available.\033[0m\n"
-                "You should consider upgrading via the 'winecord update' command.\n\n",
-                WINECORD_VERSION, latest);
+        styled_printf(stderr, "\033[1;33m",
+                      "WARNING: You are using WineCord version %s; however, version %s is available.\n",
+                      WINECORD_VERSION, latest);
+        fprintf(stderr, "You should consider upgrading via the 'winecord update' command.\n\n");
     }
 }
 
-static int run_process(char *const argv[]) {
+static int run_process_env(char *const argv[], bool homebrew_no_auto_update) {
     fflush(stdout);
     fflush(stderr);
     pid_t pid = fork();
@@ -2549,6 +2613,10 @@ static int run_process(char *const argv[]) {
         return 1;
     }
     if (pid == 0) {
+        if (homebrew_no_auto_update) {
+            setenv("HOMEBREW_NO_AUTO_UPDATE", "1", 1);
+            setenv("HOMEBREW_NO_ENV_HINTS", "1", 1);
+        }
         execv(argv[0], argv);
         _exit(127);
     }
@@ -2562,12 +2630,53 @@ static int run_process(char *const argv[]) {
     return WEXITSTATUS(status);
 }
 
+static int run_process(char *const argv[]) {
+    return run_process_env(argv, false);
+}
+
 static bool brew_prefix_for_winecord(const char *brew, char *out, size_t out_len) {
     char qbrew[PATH_MAX + 8];
     char cmd[(PATH_MAX * 2) + 64];
     if (shell_quote(brew, qbrew, sizeof(qbrew)) != 0) return false;
     snprintf(cmd, sizeof(cmd), "%s --prefix winecord 2>/dev/null", qbrew);
     return command_capture(cmd, out, out_len) == 0 && is_directory(out);
+}
+
+static bool brew_tap_repo(const char *brew, char *out, size_t out_len) {
+    char qbrew[PATH_MAX + 8];
+    char cmd[(PATH_MAX * 2) + 96];
+    if (shell_quote(brew, qbrew, sizeof(qbrew)) != 0) return false;
+    snprintf(cmd, sizeof(cmd), "%s --repo zard-studios/tap 2>/dev/null", qbrew);
+    return command_capture(cmd, out, out_len) == 0 && is_directory(out);
+}
+
+static int ensure_zard_tap(const char *brew, char *tap_repo, size_t tap_repo_len) {
+    if (brew_tap_repo(brew, tap_repo, tap_repo_len)) return 0;
+
+    print_header("Installing Zard Studios tap");
+    char *tap_argv[] = { (char *)brew, "tap", "zard-studios/tap", NULL };
+    int status = run_process_env(tap_argv, true);
+    if (status != 0) return status;
+
+    if (brew_tap_repo(brew, tap_repo, tap_repo_len)) return 0;
+    fprintf(stderr, "Could not locate zard-studios/tap after tapping it.\n");
+    return 1;
+}
+
+static int refresh_zard_tap_only(const char *brew, char *tap_repo, size_t tap_repo_len) {
+    int status = ensure_zard_tap(brew, tap_repo, tap_repo_len);
+    if (status != 0) return status;
+
+    char git[PATH_MAX];
+    if (!command_path("git", git, sizeof(git))) {
+        fprintf(stderr, "Git was not found. Homebrew taps need git to update.\n");
+        return 1;
+    }
+
+    print_header("Refreshing Zard Studios tap");
+    print_note("  %s\n", tap_repo);
+    char *pull_argv[] = { git, "-C", tap_repo, "pull", "--ff-only", NULL };
+    return run_process(pull_argv);
 }
 
 static int update_winecord(const Config *cfg, int argc, char **argv) {
@@ -2587,18 +2696,21 @@ static int update_winecord(const Config *cfg, int argc, char **argv) {
         return 1;
     }
 
-    printf("Updating WineCord through Homebrew...\n\n");
-    char *update_argv[] = { brew, "update", NULL };
-    int update_status = run_process(update_argv);
-    if (update_status != 0) return update_status;
+    print_header("Updating WineCord");
+    print_note("  This refreshes only zard-studios/tap, not Homebrew/core.\n");
 
+    char tap_repo[PATH_MAX] = "";
+    int tap_status = refresh_zard_tap_only(brew, tap_repo, sizeof(tap_repo));
+    if (tap_status != 0) return tap_status;
+
+    print_header("Upgrading WineCord package");
     char *upgrade_argv[] = { brew, "upgrade", "zard-studios/tap/winecord", NULL };
-    int upgrade_status = run_process(upgrade_argv);
+    int upgrade_status = run_process_env(upgrade_argv, true);
     if (upgrade_status != 0) return upgrade_status;
 
     clear_update_cache(cfg);
     if (!refresh_setup) {
-        printf("\nWineCord update complete.\n");
+        print_success("WineCord update complete.\n");
         return 0;
     }
 
@@ -2609,35 +2721,41 @@ static int update_winecord(const Config *cfg, int argc, char **argv) {
     }
     if (!path_exists(updated_exe)) launch_executable(updated_exe, sizeof(updated_exe));
 
-    printf("\nRefreshing WineCord setup...\n");
+    print_header("Refreshing WineCord setup");
     char *setup_argv[] = { updated_exe, "setup", NULL };
     int setup_status = run_process(setup_argv);
     if (setup_status != 0) return setup_status;
 
-    printf("\nWineCord update complete.\n");
+    print_success("WineCord update complete.\n");
     return 0;
 }
 
 static void usage(FILE *out) {
-    fprintf(out,
-            "WineCord %s\n"
-            "Created by Zard Studios. Copyright (c) 2026 Zard Studios.\n\n"
-            "Usage:\n"
-            "  winecord setup [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
-            "  winecord uninstall [--prefix PATH] [--wine PATH] [--keep-config] [--keep-logs] [--no-prefix]\n"
-            "  winecord agent\n"
-            "  winecord doctor\n"
-            "  winecord clear [--client-id ID] [--pid PID]\n"
-            "  winecord logs [--follow] [--prefix PATH]\n"
-            "  winecord install-agent\n"
-            "  winecord uninstall-agent\n"
-            "  winecord start\n"
-            "  winecord stop\n"
-            "  winecord update [--no-setup]\n"
-            "  winecord install-bottle [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
-            "  winecord install-prefix [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n"
-            "  winecord --version\n",
-            WINECORD_VERSION);
+    styled_printf(out, "\033[1;36m", "WineCord %s\n", WINECORD_VERSION);
+    fprintf(out, "Created by Zard Studios. Copyright (c) 2026 Zard Studios.\n\n");
+
+    styled_printf(out, "\033[1m", "Usage\n");
+    styled_printf(out, "\033[1m", "  Setup\n");
+    fprintf(out, "    winecord setup [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n");
+    fprintf(out, "    winecord update [--no-setup]\n");
+    fprintf(out, "    winecord uninstall [--prefix PATH] [--wine PATH] [--keep-config] [--keep-logs] [--no-prefix]\n\n");
+
+    styled_printf(out, "\033[1m", "  Diagnostics\n");
+    fprintf(out, "    winecord doctor\n");
+    fprintf(out, "    winecord logs [--follow] [--prefix PATH]\n");
+    fprintf(out, "    winecord clear [--client-id ID] [--pid PID]\n\n");
+
+    styled_printf(out, "\033[1m", "  Agent\n");
+    fprintf(out, "    winecord start\n");
+    fprintf(out, "    winecord stop\n");
+    fprintf(out, "    winecord agent\n");
+    fprintf(out, "    winecord install-agent\n");
+    fprintf(out, "    winecord uninstall-agent\n\n");
+
+    styled_printf(out, "\033[1m", "  Advanced\n");
+    fprintf(out, "    winecord install-bottle [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n");
+    fprintf(out, "    winecord install-prefix [--prefix PATH] [--wine PATH] [--helper PATH] [--no-register]\n");
+    fprintf(out, "    winecord --version\n");
 }
 
 int main(int argc, char **argv) {

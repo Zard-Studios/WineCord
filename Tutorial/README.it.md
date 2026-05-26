@@ -90,9 +90,9 @@ chiede di rieseguire `winecord uninstall` dopo aver montato il disco.
 winecord update
 ```
 
-Questo esegue l'update di Homebrew, aggiorna WineCord e rinfresca LaunchAgent
-e helper lato Wine già installati. Se vuoi aggiornare solo il pacchetto
-Homebrew:
+Questo aggiorna solo il tap Homebrew di Zard Studios, aggiorna WineCord e
+rinfresca LaunchAgent e helper lato Wine già installati. Non aggiorna pacchetti
+Homebrew non collegati. Se vuoi aggiornare solo il pacchetto Homebrew:
 
 ```sh
 winecord update --no-setup

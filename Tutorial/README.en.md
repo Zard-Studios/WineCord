@@ -89,9 +89,9 @@ uninstall` again after the drive is mounted.
 winecord update
 ```
 
-This runs the Homebrew update, upgrades WineCord, and refreshes the installed
-LaunchAgent and Wine-side helper. If you only want to upgrade the Homebrew
-package:
+This refreshes only the Zard Studios Homebrew tap, upgrades WineCord, and
+refreshes the installed LaunchAgent and Wine-side helper. It does not upgrade
+unrelated Homebrew packages. If you only want to upgrade the Homebrew package:
 
 ```sh
 winecord update --no-setup

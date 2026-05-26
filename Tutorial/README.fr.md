@@ -91,9 +91,10 @@ demande de relancer `winecord uninstall` une fois le disque monté.
 winecord update
 ```
 
-Cette commande lance la mise à jour Homebrew, met WineCord à jour et rafraîchit
-le LaunchAgent ainsi que le helper côté Wine déjà installés. Si tu veux
-seulement mettre à jour le paquet Homebrew :
+Cette commande rafraîchit uniquement le tap Homebrew de Zard Studios, met
+WineCord à jour et rafraîchit le LaunchAgent ainsi que le helper côté Wine déjà
+installés. Elle ne met pas à jour les paquets Homebrew sans lien avec WineCord.
+Si tu veux seulement mettre à jour le paquet Homebrew :
 
 ```sh
 winecord update --no-setup

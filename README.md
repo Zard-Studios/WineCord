@@ -36,7 +36,7 @@ Select your language to start the setup guide / Seleziona la tua lingua per iniz
 - Homebrew installation through the Zard Studios tap.
 - Automatic setup for common macOS Wine apps and prefixes.
 - Supports CrossOver, Whisky, Wineskin, Heroic, and regular Wine prefixes.
-- One-command updates through WineCord and Homebrew.
+- One-command WineCord updates without upgrading unrelated Homebrew packages.
 - Clean uninstall for the macOS agent and the Wine-side helper.
 
 ## 🤝 Credits
