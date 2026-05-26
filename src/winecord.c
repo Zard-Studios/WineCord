@@ -28,7 +28,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.0"
+#define WINECORD_VERSION "0.1.4"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
@@ -381,9 +381,76 @@ static ssize_t write_all(int fd, const void *buf, size_t len) {
     return (ssize_t)total;
 }
 
+static uint32_t read_le32(const unsigned char *p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void extract_json_string(const unsigned char *payload, size_t payload_len,
+                                const char *key, char *out, size_t out_len) {
+    out[0] = '\0';
+    if (!payload || !key || out_len == 0) return;
+
+    char needle[96];
+    if (snprintf(needle, sizeof(needle), "\"%s\"", key) >= (int)sizeof(needle)) return;
+    size_t needle_len = strlen(needle);
+
+    for (size_t i = 0; i + needle_len < payload_len; i++) {
+        if (memcmp(payload + i, needle, needle_len) != 0) continue;
+
+        size_t j = i + needle_len;
+        while (j < payload_len && payload[j] != ':') j++;
+        if (j >= payload_len) return;
+        j++;
+        while (j < payload_len && isspace(payload[j])) j++;
+        if (j >= payload_len || payload[j] != '"') return;
+        j++;
+
+        size_t pos = 0;
+        while (j < payload_len && payload[j] != '"' && pos + 1 < out_len) {
+            if (payload[j] == '\\' && j + 1 < payload_len) j++;
+            unsigned char c = payload[j++];
+            out[pos++] = (c >= 32 && c < 127) ? (char)c : '?';
+        }
+        out[pos] = '\0';
+        return;
+    }
+}
+
+static void log_ipc_frame(const char *direction, const unsigned char *buf, ssize_t n) {
+    if (n < 8) {
+        fprintf(stdout, "%s IPC bytes: %zd (partial frame)\n", direction, n);
+        fflush(stdout);
+        return;
+    }
+
+    uint32_t opcode = read_le32(buf);
+    uint32_t declared_len = read_le32(buf + 4);
+    size_t available = (size_t)n > 8 ? (size_t)n - 8 : 0;
+    size_t payload_len = declared_len < available ? declared_len : available;
+    const unsigned char *payload = buf + 8;
+
+    char client_id[80];
+    char command[80];
+    extract_json_string(payload, payload_len, "client_id", client_id, sizeof(client_id));
+    extract_json_string(payload, payload_len, "cmd", command, sizeof(command));
+
+    fprintf(stdout, "%s IPC frame: opcode=%u length=%u",
+            direction, opcode, declared_len);
+    if (client_id[0]) fprintf(stdout, " client_id=%s", client_id);
+    if (command[0]) fprintf(stdout, " cmd=%s", command);
+    if ((uint32_t)payload_len < declared_len) fprintf(stdout, " payload=partial");
+    fprintf(stdout, "\n");
+    fflush(stdout);
+}
+
 static int bridge_loop(int a, int b) {
     unsigned char buf[16384];
     struct pollfd fds[2];
+    bool logged_client_frame = false;
+    bool logged_discord_frame = false;
     fds[0].fd = a;
     fds[0].events = POLLIN;
     fds[1].fd = b;
@@ -401,6 +468,13 @@ static int bridge_loop(int a, int b) {
                 ssize_t n = read(from, buf, sizeof(buf));
                 if (n < 0 && errno == EINTR) continue;
                 if (n <= 0) return 0;
+                if (from == a && !logged_client_frame) {
+                    log_ipc_frame("Client -> Discord", buf, n);
+                    logged_client_frame = true;
+                } else if (from == b && !logged_discord_frame) {
+                    log_ipc_frame("Discord -> Client", buf, n);
+                    logged_discord_frame = true;
+                }
                 if (write_all(to, buf, (size_t)n) < 0) return -1;
             }
             if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) return 0;
@@ -617,6 +691,36 @@ static int doctor(const Config *cfg) {
         snprintf(helper, sizeof(helper), "%s/drive_c/windows/winecord-bridge.exe", bottle);
         printf("  helper: %s\n", path_exists(helper) ? helper : "not installed");
     }
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "launchctl print gui/%d/%s 2>/dev/null", getuid(), WINECORD_LABEL);
+    FILE *p = popen(cmd, "r");
+    char state[64] = "not loaded";
+    char program[PATH_MAX] = "not loaded";
+    if (p) {
+        char line[1024];
+        while (fgets(line, sizeof(line), p)) {
+            char *t = trim(line);
+            const char state_prefix[] = "state = ";
+            const char program_prefix[] = "program = ";
+            if (strncmp(t, state_prefix, strlen(state_prefix)) == 0) {
+                snprintf(state, sizeof(state), "%s", t + strlen(state_prefix));
+            } else if (strncmp(t, program_prefix, strlen(program_prefix)) == 0) {
+                snprintf(program, sizeof(program), "%s", t + strlen(program_prefix));
+            }
+        }
+        pclose(p);
+    }
+
+    char expected[PATH_MAX];
+    launch_executable(expected, sizeof(expected));
+    printf("\nLaunchAgent:\n");
+    printf("  state:    %s\n", state);
+    printf("  program:  %s\n", program);
+    printf("  expected: %s\n", expected);
+    if (strcmp(program, "not loaded") != 0 && strcmp(program, expected) != 0) {
+        printf("  warning: LaunchAgent is still using an older WineCord path; run `winecord setup` to reload it.\n");
+    }
     return 0;
 }
 
@@ -640,6 +744,56 @@ static int shell_quote(const char *in, char *out, size_t out_len) {
     out[pos++] = '\'';
     out[pos] = '\0';
     return 0;
+}
+
+static int show_logs(const Config *cfg, int argc, char **argv) {
+    const char *bottle = NULL;
+    bool follow = false;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--bottle") == 0 && i + 1 < argc) {
+            bottle = argv[++i];
+        } else if (strcmp(argv[i], "--follow") == 0 || strcmp(argv[i], "-f") == 0) {
+            follow = true;
+        } else {
+            fprintf(stderr, "Unknown logs option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    char discovered[PATH_MAX];
+    if (!bottle) {
+        discover_steam_bottle(discovered, sizeof(discovered));
+        bottle = discovered[0] ? discovered : NULL;
+    }
+
+    char agent_log[PATH_MAX];
+    char bridge_log[PATH_MAX];
+    snprintf(agent_log, sizeof(agent_log), "%s/agent.log", cfg->log_dir);
+    if (bottle) {
+        snprintf(bridge_log, sizeof(bridge_log), "%s/drive_c/users/Public/WineCord/bridge.log", bottle);
+    } else {
+        bridge_log[0] = '\0';
+    }
+
+    printf("Agent log:  %s\n", agent_log);
+    if (bridge_log[0]) printf("Bridge log: %s\n", bridge_log);
+    printf("\n");
+    fflush(stdout);
+
+    char q_agent[PATH_MAX + 8];
+    char q_bridge[PATH_MAX + 8];
+    if (shell_quote(agent_log, q_agent, sizeof(q_agent)) != 0) return 1;
+
+    char cmd[(PATH_MAX * 3) + 128];
+    const char *mode = follow ? "-f" : "";
+    if (bridge_log[0] && path_exists(bridge_log) && shell_quote(bridge_log, q_bridge, sizeof(q_bridge)) == 0) {
+        snprintf(cmd, sizeof(cmd), "tail -n 80 %s %s %s", mode, q_agent, q_bridge);
+    } else {
+        snprintf(cmd, sizeof(cmd), "tail -n 80 %s %s", mode, q_agent);
+    }
+    int rc = system(cmd);
+    return rc == 0 ? 0 : 1;
 }
 
 static int install_agent(const Config *cfg) {
@@ -686,8 +840,13 @@ static int install_agent(const Config *cfg) {
     char qplist[PATH_MAX + 8];
     char cmd[(PATH_MAX * 2) + 128];
     shell_quote(plist, qplist, sizeof(qplist));
-    snprintf(cmd, sizeof(cmd), "launchctl bootstrap gui/%d %s 2>/dev/null || true", getuid(), qplist);
+    snprintf(cmd, sizeof(cmd), "launchctl bootout gui/%d/%s 2>/dev/null || true", getuid(), WINECORD_LABEL);
     system(cmd);
+    snprintf(cmd, sizeof(cmd), "launchctl bootstrap gui/%d %s", getuid(), qplist);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Could not load LaunchAgent with launchctl.\n");
+        return 1;
+    }
     snprintf(cmd, sizeof(cmd), "launchctl kickstart -k gui/%d/%s 2>/dev/null || true", getuid(), WINECORD_LABEL);
     system(cmd);
 
@@ -849,13 +1008,13 @@ static int run_crossover_helper(const char *bottle, const char *helper_path, con
     char bottle_parent[PATH_MAX];
     parent_dir(bottle, bottle_parent, sizeof(bottle_parent));
 
+    fflush(stdout);
+    fflush(stderr);
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "fork failed: %s\n", strerror(errno));
         return 1;
     }
-    fflush(stdout);
-    fflush(stderr);
     if (pid == 0) {
         setenv("CX_BOTTLE_PATH", bottle_parent, 1);
         execl(wine, "wine", "--bottle", bottle_name, "--no-gui", helper_path, helper_arg, (char *)NULL);
@@ -1065,6 +1224,7 @@ static void usage(FILE *out) {
             "  winecord uninstall [--bottle PATH] [--keep-config] [--keep-logs]\n"
             "  winecord agent\n"
             "  winecord doctor\n"
+            "  winecord logs [--follow] [--bottle PATH]\n"
             "  winecord install-agent\n"
             "  winecord uninstall-agent\n"
             "  winecord start\n"
@@ -1093,6 +1253,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "uninstall") == 0) return uninstall_all(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "agent") == 0) return run_agent(&cfg);
     if (strcmp(cmd, "doctor") == 0) return doctor(&cfg);
+    if (strcmp(cmd, "logs") == 0) return show_logs(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "install-agent") == 0) return install_agent(&cfg);
     if (strcmp(cmd, "uninstall-agent") == 0) return uninstall_agent();
     if (strcmp(cmd, "start") == 0) return start_agent();

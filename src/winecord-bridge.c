@@ -9,9 +9,10 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
-#define WINECORD_VERSION "0.1.0"
+#define WINECORD_VERSION "0.1.4"
 #define SERVICE_NAME "WineCordBridge"
 #define CONFIG_PATH "C:\\users\\Public\\WineCord\\config.ini"
 #define LOG_PATH "C:\\users\\Public\\WineCord\\bridge.log"
@@ -29,6 +30,9 @@ typedef struct {
 typedef struct {
     HANDLE pipe;
     SOCKET socket;
+    char pipe_name[64];
+    LONG logged_client_frame;
+    LONG logged_discord_frame;
 } BridgePair;
 
 typedef struct {
@@ -128,6 +132,85 @@ static bool write_all_pipe(HANDLE pipe, const char *buf, DWORD len) {
     return true;
 }
 
+static uint32_t read_le32(const unsigned char *p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void extract_json_string(const unsigned char *payload, size_t payload_len,
+                                const char *key, char *out, size_t out_len) {
+    out[0] = '\0';
+    if (!payload || !key || out_len == 0) return;
+
+    char needle[96];
+    _snprintf(needle, sizeof(needle), "\"%s\"", key);
+    needle[sizeof(needle) - 1] = '\0';
+    size_t needle_len = strlen(needle);
+
+    for (size_t i = 0; i + needle_len < payload_len; i++) {
+        if (memcmp(payload + i, needle, needle_len) != 0) continue;
+
+        size_t j = i + needle_len;
+        while (j < payload_len && payload[j] != ':') j++;
+        if (j >= payload_len) return;
+        j++;
+        while (j < payload_len && (payload[j] == ' ' || payload[j] == '\t' ||
+                                   payload[j] == '\r' || payload[j] == '\n')) {
+            j++;
+        }
+        if (j >= payload_len || payload[j] != '"') return;
+        j++;
+
+        size_t pos = 0;
+        while (j < payload_len && payload[j] != '"' && pos + 1 < out_len) {
+            if (payload[j] == '\\' && j + 1 < payload_len) j++;
+            unsigned char c = payload[j++];
+            out[pos++] = (c >= 32 && c < 127) ? (char)c : '?';
+        }
+        out[pos] = '\0';
+        return;
+    }
+}
+
+static void log_ipc_frame(const char *pipe_name, const char *direction,
+                          const unsigned char *buf, DWORD n) {
+    if (n < 8) {
+        log_line("%s %s IPC bytes: %lu (partial frame)", pipe_name, direction, (unsigned long)n);
+        return;
+    }
+
+    uint32_t opcode = read_le32(buf);
+    uint32_t declared_len = read_le32(buf + 4);
+    size_t available = n > 8 ? (size_t)n - 8 : 0;
+    size_t payload_len = declared_len < available ? declared_len : available;
+    const unsigned char *payload = buf + 8;
+
+    char client_id[80];
+    char command[80];
+    extract_json_string(payload, payload_len, "client_id", client_id, sizeof(client_id));
+    extract_json_string(payload, payload_len, "cmd", command, sizeof(command));
+
+    char extra[192];
+    extra[0] = '\0';
+    if (client_id[0]) {
+        _snprintf(extra + strlen(extra), sizeof(extra) - strlen(extra), " client_id=%s", client_id);
+        extra[sizeof(extra) - 1] = '\0';
+    }
+    if (command[0]) {
+        _snprintf(extra + strlen(extra), sizeof(extra) - strlen(extra), " cmd=%s", command);
+        extra[sizeof(extra) - 1] = '\0';
+    }
+    if ((uint32_t)payload_len < declared_len) {
+        _snprintf(extra + strlen(extra), sizeof(extra) - strlen(extra), " payload=partial");
+        extra[sizeof(extra) - 1] = '\0';
+    }
+
+    log_line("%s %s IPC frame: opcode=%lu length=%lu%s",
+             pipe_name, direction, (unsigned long)opcode, (unsigned long)declared_len, extra);
+}
+
 static SOCKET connect_agent(const Config *cfg) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) {
@@ -170,6 +253,9 @@ static DWORD WINAPI pipe_to_socket_thread(LPVOID param) {
         DWORD read_bytes = 0;
         if (!ReadFile(pair->pipe, buffer, sizeof(buffer), &read_bytes, NULL)) break;
         if (read_bytes == 0) break;
+        if (InterlockedCompareExchange(&pair->logged_client_frame, 1, 0) == 0) {
+            log_ipc_frame(pair->pipe_name, "client -> Discord", (const unsigned char *)buffer, read_bytes);
+        }
         if (!send_all_socket(pair->socket, buffer, (int)read_bytes)) break;
     }
 
@@ -185,6 +271,9 @@ static DWORD WINAPI socket_to_pipe_thread(LPVOID param) {
     for (;;) {
         int n = recv(pair->socket, buffer, sizeof(buffer), 0);
         if (n <= 0) break;
+        if (InterlockedCompareExchange(&pair->logged_discord_frame, 1, 0) == 0) {
+            log_ipc_frame(pair->pipe_name, "Discord -> client", (const unsigned char *)buffer, (DWORD)n);
+        }
         if (!write_all_pipe(pair->pipe, buffer, (DWORD)n)) break;
     }
 
@@ -193,10 +282,13 @@ static DWORD WINAPI socket_to_pipe_thread(LPVOID param) {
     return 0;
 }
 
-static void bridge_connection(HANDLE pipe, SOCKET s) {
+static void bridge_connection(HANDLE pipe, SOCKET s, const char *pipe_name) {
     BridgePair pair;
     pair.pipe = pipe;
     pair.socket = s;
+    lstrcpynA(pair.pipe_name, pipe_name, sizeof(pair.pipe_name));
+    pair.logged_client_frame = 0;
+    pair.logged_discord_frame = 0;
 
     HANDLE threads[2];
     threads[0] = CreateThread(NULL, 0, pipe_to_socket_thread, &pair, 0, NULL);
@@ -258,7 +350,7 @@ static DWORD WINAPI pipe_listener_thread(LPVOID param) {
         log_line("%s connected", pipe_name);
         SOCKET s = connect_agent(&cfg);
         if (s != INVALID_SOCKET) {
-            bridge_connection(pipe, s);
+            bridge_connection(pipe, s, pipe_name);
             closesocket(s);
         }
 
@@ -361,6 +453,36 @@ static int run_service_dispatcher(void) {
     return 0;
 }
 
+static bool wait_service_state(SC_HANDLE svc, DWORD desired_state, DWORD timeout_ms) {
+    DWORD waited = 0;
+    while (waited <= timeout_ms) {
+        SERVICE_STATUS_PROCESS status;
+        DWORD needed = 0;
+        if (!QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&status,
+                                  sizeof(status), &needed)) {
+            return false;
+        }
+        if (status.dwCurrentState == desired_state) return true;
+        Sleep(250);
+        waited += 250;
+    }
+    return false;
+}
+
+static void stop_service_if_running(SC_HANDLE svc) {
+    SERVICE_STATUS_PROCESS status;
+    DWORD needed = 0;
+    if (!QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&status,
+                              sizeof(status), &needed)) {
+        return;
+    }
+    if (status.dwCurrentState == SERVICE_STOPPED) return;
+
+    SERVICE_STATUS stop_status;
+    ControlService(svc, SERVICE_CONTROL_STOP, &stop_status);
+    wait_service_state(svc, SERVICE_STOPPED, 10000);
+}
+
 static int install_service(void) {
     char exe[MAX_PATH];
     if (!GetModuleFileNameA(NULL, exe, sizeof(exe))) {
@@ -372,12 +494,13 @@ static int install_service(void) {
     _snprintf(command, sizeof(command), "\"%s\" --service", exe);
     command[sizeof(command) - 1] = '\0';
 
-    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CREATE_SERVICE | SC_MANAGER_CONNECT);
     if (!scm) {
         fprintf(stderr, "OpenSCManager failed: %lu\n", GetLastError());
         return 1;
     }
 
+    bool existed = false;
     SC_HANDLE svc = CreateServiceA(
         scm,
         SERVICE_NAME,
@@ -394,6 +517,7 @@ static int install_service(void) {
         NULL);
 
     if (!svc && GetLastError() == ERROR_SERVICE_EXISTS) {
+        existed = true;
         svc = OpenServiceA(scm, SERVICE_NAME, SERVICE_ALL_ACCESS);
     }
     if (!svc) {
@@ -402,11 +526,37 @@ static int install_service(void) {
         return 1;
     }
 
+    if (existed) {
+        stop_service_if_running(svc);
+        if (!ChangeServiceConfigA(
+                svc,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                command,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                "WineCord Discord IPC Bridge")) {
+            fprintf(stderr, "ChangeServiceConfig failed: %lu\n", GetLastError());
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return 1;
+        }
+    }
+
     SERVICE_DESCRIPTIONA desc;
     desc.lpDescription = "Forwards Discord Rich Presence IPC from Wine/CrossOver games to WineCord on macOS.";
     ChangeServiceConfig2A(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
 
-    StartServiceA(svc, 0, NULL);
+    if (!StartServiceA(svc, 0, NULL) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
+        fprintf(stderr, "StartService failed: %lu\n", GetLastError());
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return 1;
+    }
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
     printf("Installed %s service.\n", SERVICE_NAME);
@@ -426,8 +576,7 @@ static int remove_service(void) {
         return 1;
     }
 
-    SERVICE_STATUS status;
-    ControlService(svc, SERVICE_CONTROL_STOP, &status);
+    stop_service_if_running(svc);
     if (!DeleteService(svc)) {
         fprintf(stderr, "DeleteService failed: %lu\n", GetLastError());
         CloseServiceHandle(svc);

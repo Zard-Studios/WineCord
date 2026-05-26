@@ -63,7 +63,7 @@ Maintainers need to do this once:
 2. Copy [Formula/winecord.rb](Formula/winecord.rb) into
    `homebrew-tap/Formula/winecord.rb`.
 3. Publish a WineCord release with
-   `dist/winecord-0.1.0-macos-universal.tar.gz`.
+   `dist/winecord-0.1.4-macos-universal.tar.gz`.
 4. Verify:
 
 ```sh
@@ -88,6 +88,7 @@ so the bottle is cleaned while the CLI is still available.
 winecord setup             # one-command local configuration
 winecord uninstall         # remove LaunchAgent, bottle helper, config, and logs
 winecord doctor            # show config, Discord IPC, and CrossOver diagnostics
+winecord logs --follow     # watch WineCord agent and bridge activity live
 winecord agent             # run the macOS forwarding agent in the foreground
 ```
 
@@ -110,7 +111,7 @@ make package
 ```
 
 The release tarball contains a universal macOS binary and the Windows helper:
-`dist/winecord-0.1.0-macos-universal.tar.gz`.
+`dist/winecord-0.1.4-macos-universal.tar.gz`.
 
 ## Smoke Test
 
@@ -139,6 +140,17 @@ Logs live in:
 ```text
 ~/Library/Logs/WineCord/
 ```
+
+The Windows bridge log also lives inside the bottle:
+
+```text
+drive_c/users/Public/WineCord/bridge.log
+```
+
+When a Windows game really opens Discord IPC, `winecord logs --follow` shows the
+pipe connection and the first IPC frame. That makes it clear whether WineCord is
+receiving Discord RPC traffic or the game is only using Steam/game activity
+detection.
 
 ## Design Notes
 
