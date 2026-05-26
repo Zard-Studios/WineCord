@@ -30,7 +30,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.13"
+#define WINECORD_VERSION "0.1.14"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -40,6 +40,7 @@
 #define MAX_TRACKED_BOTTLES 16
 #define MAX_STEAM_ACTIVITY 32
 #define WINECORD_FALLBACK_POLL_SECONDS 5
+#define WINECORD_FALLBACK_GRACE_SECONDS 15
 #define WINECORD_FALLBACK_REFRESH_SECONDS 60
 #define WINECORD_UPDATE_CHECK_INTERVAL 86400
 #define WINECORD_FORMULA_URL "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/Formula/winecord.rb"
@@ -1364,6 +1365,44 @@ static bool steam_app_icon_url(const char *steam_root, const char *appid,
     return found;
 }
 
+static bool steam_cache_asset_exists(const char *steam_root, const char *appid,
+                                     const char *asset_name) {
+    if (!steam_root || !appid || !asset_name) return false;
+
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/appcache/librarycache/%s/%s",
+                 steam_root, appid, asset_name) >= (int)sizeof(path)) {
+        return false;
+    }
+    return path_exists(path);
+}
+
+static void steam_fallback_art_url(const char *steam_root, const char *appid,
+                                   char *out, size_t out_len) {
+    if (!appid || !out || out_len == 0) return;
+    out[0] = '\0';
+
+    if (steam_cache_asset_exists(steam_root, appid, "library_600x900.jpg")) {
+        snprintf(out, out_len,
+                 "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/library_600x900.jpg",
+                 appid);
+        return;
+    }
+
+    if (steam_cache_asset_exists(steam_root, appid, "header.jpg")) {
+        snprintf(out, out_len,
+                 "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/capsule_616x353.jpg",
+                 appid);
+        return;
+    }
+
+    if (steam_app_icon_url(steam_root, appid, out, out_len)) return;
+
+    snprintf(out, out_len,
+             "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/header.jpg",
+             appid);
+}
+
 static int collect_steam_activity_for_prefix(const char *prefix,
                                              SteamActivityCounter games[],
                                              int max_games,
@@ -1531,14 +1570,10 @@ static int send_fallback_activity(int fd, const SteamActivity *game, time_t star
 
     char image_url[512];
     char steam_root[PATH_MAX] = "";
-    if (!steam_root_for_prefix(game->prefix, steam_root, sizeof(steam_root)) ||
-        !steam_app_icon_url(steam_root, game->appid, image_url, sizeof(image_url))) {
-        snprintf(image_url, sizeof(image_url),
-                 "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/header.jpg",
-                 game->appid);
-    }
+    steam_root_for_prefix(game->prefix, steam_root, sizeof(steam_root));
+    steam_fallback_art_url(steam_root, game->appid, image_url, sizeof(image_url));
 
-    char json[2048];
+    char json[3072];
     snprintf(json, sizeof(json),
              "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":%ld,\"activity\":{"
              "\"name\":\"%s\","
@@ -1576,7 +1611,9 @@ static void *fallback_monitor_thread(void *arg) {
     int discord_fd = -1;
     char active_appid[32] = "";
     char active_name[256] = "";
+    char candidate_appid[32] = "";
     time_t started_at = 0;
+    time_t candidate_since = 0;
     time_t last_sent = 0;
 
     for (;;) {
@@ -1595,27 +1632,46 @@ static void *fallback_monitor_thread(void *arg) {
             }
             active_appid[0] = '\0';
             active_name[0] = '\0';
+            candidate_appid[0] = '\0';
+            started_at = 0;
+            candidate_since = 0;
+            last_sent = 0;
+            sleep(WINECORD_FALLBACK_POLL_SECONDS);
+            continue;
+        }
+
+        time_t now = time(NULL);
+        if (strcmp(candidate_appid, game.appid) != 0) {
+            snprintf(candidate_appid, sizeof(candidate_appid), "%s", game.appid);
+            candidate_since = now;
+        }
+
+        if (active_appid[0] && strcmp(active_appid, game.appid) != 0) {
+            if (discord_fd >= 0) {
+                send_fallback_clear(discord_fd);
+                close(discord_fd);
+                discord_fd = -1;
+            }
+            active_appid[0] = '\0';
+            active_name[0] = '\0';
             started_at = 0;
             last_sent = 0;
+        }
+
+        if (!active_appid[0] && now - candidate_since < WINECORD_FALLBACK_GRACE_SECONDS) {
             sleep(WINECORD_FALLBACK_POLL_SECONDS);
             continue;
         }
 
         bool changed = strcmp(active_appid, game.appid) != 0;
         if (changed) {
-            if (discord_fd >= 0) {
-                send_fallback_clear(discord_fd);
-                close(discord_fd);
-                discord_fd = -1;
-            }
             snprintf(active_appid, sizeof(active_appid), "%s", game.appid);
             snprintf(active_name, sizeof(active_name), "%s", game.name);
-            started_at = time(NULL);
+            started_at = now;
             last_sent = 0;
         }
 
         if (discord_fd < 0) discord_fd = open_fallback_discord();
-        time_t now = time(NULL);
         if (discord_fd >= 0 &&
             (changed || last_sent == 0 || now - last_sent >= WINECORD_FALLBACK_REFRESH_SECONDS)) {
             if (send_fallback_activity(discord_fd, &game, started_at) == 0) {
