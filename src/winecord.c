@@ -28,7 +28,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.5"
+#define WINECORD_VERSION "0.1.6"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_DEFAULT_PORT 38477
 #define WINECORD_PIPE_COUNT 10
@@ -1285,20 +1285,26 @@ static int start_agent(const Config *cfg) {
     if (!path_exists(plist)) return install_agent(cfg);
 
     char cmd[(PATH_MAX * 2) + 128];
-    snprintf(cmd, sizeof(cmd), "launchctl print gui/%d/%s >/dev/null 2>&1", getuid(), WINECORD_LABEL);
-    if (system(cmd) != 0) {
-        char qplist[PATH_MAX + 8];
-        if (shell_quote(plist, qplist, sizeof(qplist)) != 0) return 1;
-        snprintf(cmd, sizeof(cmd), "launchctl bootstrap gui/%d %s", getuid(), qplist);
+    char qplist[PATH_MAX + 8];
+    if (shell_quote(plist, qplist, sizeof(qplist)) != 0) return 1;
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        snprintf(cmd, sizeof(cmd), "launchctl print gui/%d/%s >/dev/null 2>&1",
+                 getuid(), WINECORD_LABEL);
         if (system(cmd) != 0) {
-            fprintf(stderr, "Could not load LaunchAgent. Run `winecord setup` to repair it.\n");
-            return 1;
+            snprintf(cmd, sizeof(cmd), "launchctl bootstrap gui/%d %s >/dev/null 2>&1",
+                     getuid(), qplist);
+            system(cmd);
         }
+
+        snprintf(cmd, sizeof(cmd), "launchctl kickstart -k gui/%d/%s >/dev/null 2>&1",
+                 getuid(), WINECORD_LABEL);
+        if (system(cmd) == 0) return 0;
+        usleep(250000);
     }
 
-    snprintf(cmd, sizeof(cmd), "launchctl kickstart -k gui/%d/%s", getuid(), WINECORD_LABEL);
-    int rc = system(cmd);
-    return rc == 0 ? 0 : 1;
+    fprintf(stderr, "Could not start LaunchAgent. Run `winecord setup` to repair it.\n");
+    return 1;
 }
 
 static int stop_agent(void) {
@@ -1651,9 +1657,11 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
                 add_path_target(bottle_targets, &bottle_target_count, cfg->bottle_paths[i]);
             }
 
-            char discovered[PATH_MAX];
-            discover_steam_bottle(discovered, sizeof(discovered));
-            if (discovered[0]) add_path_target(bottle_targets, &bottle_target_count, discovered);
+            if (bottle_target_count == 0) {
+                char discovered[PATH_MAX];
+                discover_steam_bottle(discovered, sizeof(discovered));
+                if (discovered[0]) add_path_target(bottle_targets, &bottle_target_count, discovered);
+            }
         }
 
         if (bottle_target_count == 0) {
