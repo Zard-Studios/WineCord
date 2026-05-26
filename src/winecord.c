@@ -36,6 +36,7 @@
 #define WINECORD_TOKEN_BYTES 32
 #define MAX_CANDIDATES 64
 #define MAX_TRACKED_BOTTLES 16
+#define MAX_STEAM_ACTIVITY 32
 #define WINECORD_UPDATE_CHECK_INTERVAL 86400
 #define WINECORD_FORMULA_URL "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/Formula/winecord.rb"
 
@@ -64,6 +65,11 @@ typedef struct {
     unsigned char pending[32768];
     size_t pending_len;
 } IpcSession;
+
+typedef struct {
+    char appid[32];
+    int process_count;
+} SteamActivityCounter;
 
 static void usage(FILE *out);
 static bool find_whisky_runner(const char *prefix, char *whisky_path, size_t whisky_len,
@@ -1121,6 +1127,193 @@ static void resolve_bottle(const Config *cfg, char *out, size_t out_len) {
     if (count > 0) snprintf(out, out_len, "%s", prefixes[0]);
 }
 
+static bool steam_root_for_prefix(const char *prefix, char *out, size_t out_len) {
+    if (!prefix || !*prefix || !out || out_len == 0) return false;
+
+    char candidate[PATH_MAX];
+    snprintf(candidate, sizeof(candidate), "%s/drive_c/Program Files (x86)/Steam", prefix);
+    if (is_directory(candidate)) {
+        snprintf(out, out_len, "%s", candidate);
+        return true;
+    }
+
+    snprintf(candidate, sizeof(candidate), "%s/drive_c/Program Files/Steam", prefix);
+    if (is_directory(candidate)) {
+        snprintf(out, out_len, "%s", candidate);
+        return true;
+    }
+
+    out[0] = '\0';
+    return false;
+}
+
+static bool parse_gameid_after(const char *line, const char *marker,
+                               char *out, size_t out_len) {
+    if (!line || !marker || !out || out_len == 0) return false;
+    const char *p = strstr(line, marker);
+    if (!p) return false;
+    p += strlen(marker);
+
+    while (*p && !isdigit((unsigned char)*p)) p++;
+    size_t pos = 0;
+    while (isdigit((unsigned char)*p) && pos + 1 < out_len) {
+        out[pos++] = *p++;
+    }
+    out[pos] = '\0';
+    return out[0] != '\0';
+}
+
+static int steam_activity_slot(SteamActivityCounter games[], int *count,
+                               const char *appid) {
+    if (!games || !count || !appid || !*appid) return -1;
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(games[i].appid, appid) == 0) return i;
+    }
+    if (*count >= MAX_STEAM_ACTIVITY) return -1;
+    snprintf(games[*count].appid, sizeof(games[*count].appid), "%s", appid);
+    games[*count].process_count = 0;
+    return (*count)++;
+}
+
+static bool read_vdf_value(const char *line, const char *key, char *out, size_t out_len) {
+    if (!line || !key || !out || out_len == 0) return false;
+    out[0] = '\0';
+
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(line, needle);
+    if (!p) return false;
+    p += strlen(needle);
+
+    const char *start = strchr(p, '"');
+    if (!start) return false;
+    start++;
+    const char *end = strchr(start, '"');
+    if (!end || end <= start) return false;
+
+    size_t len = (size_t)(end - start);
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool steam_app_name(const char *steam_root, const char *appid,
+                           char *out, size_t out_len) {
+    if (!steam_root || !appid || !out || out_len == 0) return false;
+    out[0] = '\0';
+
+    char manifest[PATH_MAX];
+    snprintf(manifest, sizeof(manifest), "%s/steamapps/appmanifest_%s.acf", steam_root, appid);
+    FILE *f = fopen(manifest, "r");
+    if (!f) return false;
+
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        char name[256];
+        if (read_vdf_value(line, "name", name, sizeof(name))) {
+            snprintf(out, out_len, "%s", name);
+            found = true;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static int collect_steam_activity_for_prefix(const char *prefix,
+                                             SteamActivityCounter games[],
+                                             int max_games,
+                                             bool *saw_log) {
+    (void)max_games;
+    if (saw_log) *saw_log = false;
+    if (!prefix || !games) return 0;
+
+    char steam_root[PATH_MAX];
+    if (!steam_root_for_prefix(prefix, steam_root, sizeof(steam_root))) return 0;
+
+    char log_path[PATH_MAX];
+    snprintf(log_path, sizeof(log_path), "%s/logs/streaming_log.txt", steam_root);
+    FILE *f = fopen(log_path, "r");
+    if (!f) return 0;
+    if (saw_log) *saw_log = true;
+
+    int count = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        char appid[sizeof(games[0].appid)];
+        int slot = -1;
+
+        if (strstr(line, "Adding process") &&
+            parse_gameid_after(line, "for gameID ", appid, sizeof(appid))) {
+            slot = steam_activity_slot(games, &count, appid);
+            if (slot >= 0) games[slot].process_count++;
+        } else if (strstr(line, "Removing process") &&
+                   parse_gameid_after(line, "for gameID ", appid, sizeof(appid))) {
+            slot = steam_activity_slot(games, &count, appid);
+            if (slot >= 0 && games[slot].process_count > 0) games[slot].process_count--;
+        } else if (parse_gameid_after(line, "game stopped [gameid=", appid, sizeof(appid))) {
+            slot = steam_activity_slot(games, &count, appid);
+            if (slot >= 0) games[slot].process_count = 0;
+        }
+    }
+    fclose(f);
+    return count;
+}
+
+static int print_steam_activity_for_prefixes(char prefixes[][PATH_MAX], int prefix_count) {
+    printf("\nSteam Activity:\n");
+    if (prefix_count <= 0) {
+        printf("  prefixes: not found\n");
+        return 0;
+    }
+
+    bool saw_any_log = false;
+    int active_total = 0;
+    for (int i = 0; i < prefix_count; i++) {
+        SteamActivityCounter games[MAX_STEAM_ACTIVITY];
+        memset(games, 0, sizeof(games));
+        bool saw_log = false;
+        int game_count = collect_steam_activity_for_prefix(prefixes[i], games,
+                                                          MAX_STEAM_ACTIVITY, &saw_log);
+        saw_any_log = saw_any_log || saw_log;
+        if (!saw_log) continue;
+
+        char steam_root[PATH_MAX] = "";
+        steam_root_for_prefix(prefixes[i], steam_root, sizeof(steam_root));
+        for (int j = 0; j < game_count; j++) {
+            if (games[j].process_count <= 0) continue;
+            char name[256] = "";
+            steam_app_name(steam_root, games[j].appid, name, sizeof(name));
+            printf("  active: %s%s%s (Steam AppID %s, %d process%s)\n",
+                   name[0] ? name : "Steam app ",
+                   name[0] ? "" : games[j].appid,
+                   name[0] ? "" : "",
+                   games[j].appid,
+                   games[j].process_count,
+                   games[j].process_count == 1 ? "" : "es");
+            printf("    prefix: %s\n", prefixes[i]);
+            active_total++;
+        }
+    }
+
+    if (!saw_any_log) {
+        printf("  logs: not found in configured Steam prefixes\n");
+    } else if (active_total == 0) {
+        printf("  active games: none detected from Steam logs\n");
+    }
+    return active_total;
+}
+
+static int steam_activity_command(const Config *cfg) {
+    char prefixes[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int prefix_count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
+    printf("WineCord Steam activity detector\n");
+    print_steam_activity_for_prefixes(prefixes, prefix_count);
+    return 0;
+}
+
 static int doctor(const Config *cfg) {
     char token[80];
     token_redacted(cfg, token, sizeof(token));
@@ -1163,6 +1356,8 @@ static int doctor(const Config *cfg) {
         printf("      runner: %s\n", runner[0] ? runner : "not found; pass --wine PATH");
         printf("      helper: %s\n", path_exists(helper) ? helper : "not installed");
     }
+
+    print_steam_activity_for_prefixes(prefixes, prefix_count);
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "launchctl print gui/%d/%s 2>/dev/null", getuid(), WINECORD_LABEL);
@@ -2742,6 +2937,7 @@ static void usage(FILE *out) {
 
     styled_printf(out, "\033[1m", "  Diagnostics\n");
     fprintf(out, "    winecord doctor\n");
+    fprintf(out, "    winecord steam\n");
     fprintf(out, "    winecord logs [--follow] [--prefix PATH]\n");
     fprintf(out, "    winecord clear [--client-id ID] [--pid PID]\n\n");
 
@@ -2779,6 +2975,7 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "uninstall") == 0) return uninstall_all(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "agent") == 0) return run_agent(&cfg);
     if (strcmp(cmd, "doctor") == 0) return doctor(&cfg);
+    if (strcmp(cmd, "steam") == 0) return steam_activity_command(&cfg);
     if (strcmp(cmd, "clear") == 0) return clear_activity_command(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "logs") == 0) return show_logs(&cfg, argc - 2, argv + 2);
     if (strcmp(cmd, "install-agent") == 0) return install_agent(&cfg);
