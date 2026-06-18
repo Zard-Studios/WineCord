@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -30,7 +31,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.16"
+#define WINECORD_VERSION "0.1.17"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -42,6 +43,7 @@
 #define WINECORD_FALLBACK_POLL_SECONDS 5
 #define WINECORD_FALLBACK_GRACE_SECONDS 15
 #define WINECORD_FALLBACK_REFRESH_SECONDS 60
+#define WINECORD_FALLBACK_IDLE_SECONDS 30
 #define WINECORD_RPC_SUPPRESS_SECONDS 90
 #define WINECORD_UPDATE_CHECK_INTERVAL 86400
 #define WINECORD_FORMULA_URL "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/Formula/winecord.rb"
@@ -88,6 +90,19 @@ typedef struct {
     Config cfg;
 } FallbackContext;
 
+/* Per-prefix incremental Steam log state — used to avoid re-reading the
+ * entire streaming_log.txt from the start on every poll cycle (Bug 2 fix). */
+typedef struct {
+    char prefix[PATH_MAX];
+    long offset;      /* byte offset of the next unread byte in the log */
+    long file_size;   /* last known file size; if it shrinks, log was rotated */
+} SteamLogState;
+
+#define MAX_LOG_STATES MAX_TRACKED_BOTTLES
+static SteamLogState g_log_states[MAX_LOG_STATES];
+static int           g_log_state_count = 0;
+static pthread_mutex_t g_log_state_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static pthread_mutex_t g_presence_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_rpc_connections = 0;
 static int g_real_rpc_sessions = 0;
@@ -104,6 +119,85 @@ static bool find_whisky_runner(const char *prefix, char *whisky_path, size_t whi
                                char *bottle_name, size_t name_len);
 static bool find_wine_runner(const Config *cfg, const char *prefix,
                              const char *override_wine, char *out, size_t out_len);
+
+/* ── Bug 1: TCC / Removable Volume helpers ─────────────────────────────── */
+
+/* Returns true if the given path resides on a removable/external volume.
+ * Uses statfs(2) with the MNT_LOCAL flag: external volumes are not local. */
+static bool is_removable_volume(const char *path) {
+    if (!path || !*path) return false;
+    struct statfs sfs;
+    if (statfs(path, &sfs) != 0) return false;
+    /* MNT_LOCAL is set for locally mounted (internal) filesystems.
+     * If it is NOT set, the volume is remote or removable. */
+    if (!(sfs.f_flags & MNT_LOCAL)) return true;
+    /* Additionally treat anything under /Volumes/ as potentially removable. */
+    return strncmp(path, "/Volumes/", 9) == 0;
+}
+
+/* Opens and immediately closes a single file/directory within the given path
+ * to consolidate TCC access prompts into one dialog rather than many.
+ * Call this once before any glob/stat loop over an external prefix. */
+static void tcc_preflight_path(const char *path) {
+    if (!path || !*path) return;
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd >= 0) close(fd);
+}
+
+/* ── Bug 2: Incremental log state helpers ──────────────────────────────── */
+
+static SteamLogState *log_state_for_prefix(const char *prefix) {
+    if (!prefix || !*prefix) return NULL;
+    pthread_mutex_lock(&g_log_state_lock);
+    for (int i = 0; i < g_log_state_count; i++) {
+        if (strcmp(g_log_states[i].prefix, prefix) == 0) {
+            pthread_mutex_unlock(&g_log_state_lock);
+            return &g_log_states[i];
+        }
+    }
+    if (g_log_state_count < MAX_LOG_STATES) {
+        SteamLogState *s = &g_log_states[g_log_state_count++];
+        snprintf(s->prefix, sizeof(s->prefix), "%s", prefix);
+        s->offset = 0;
+        s->file_size = 0;
+        pthread_mutex_unlock(&g_log_state_lock);
+        return s;
+    }
+    pthread_mutex_unlock(&g_log_state_lock);
+    return NULL;
+}
+
+/* Returns true if any wineserver/wine64/wine process is currently running.
+ * Used to guard against stale log state after a Wine session ends. */
+static bool is_wine_process_running(void) {
+    FILE *p = popen("pgrep -x 'wineserver|wine64|wine' >/dev/null 2>&1 && echo 1", "r");
+    if (!p) return false;
+    char buf[8] = "";
+    (void)fgets(buf, sizeof(buf), p);
+    pclose(p);
+    return buf[0] == '1';
+}
+
+/* ── Bug 3: Steam CDN URL validation ───────────────────────────────────── */
+
+/* Performs a HEAD request via curl to check whether a CDN URL actually exists.
+ * Returns true only for 2xx HTTP status codes. Timeout is kept very short
+ * (1s connect, 2s total) to avoid delaying Rich Presence startup. */
+static bool steam_cdn_url_exists(const char *url) {
+    if (!url || !*url) return false;
+    char cmd[1024];
+    if (snprintf(cmd, sizeof(cmd),
+                 "/usr/bin/curl -fsS -o /dev/null -w '%%{http_code}' "
+                 "--connect-timeout 1 --max-time 2 --head %s 2>/dev/null",
+                 url) >= (int)sizeof(cmd)) return false;
+    FILE *p = popen(cmd, "r");
+    if (!p) return false;
+    char status[8] = "";
+    (void)fgets(status, sizeof(status), p);
+    pclose(p);
+    /* Accept any 2xx response */
+    return status[0] == '2';
+}
 
 static const char *home_dir(void) {
     const char *home = getenv("HOME");
@@ -1205,6 +1299,17 @@ static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int
     snprintf(pattern, sizeof(pattern), "%s/Wine Prefixes/*", home_dir());
     add_prefix_glob(paths, &count, pattern);
 
+    /* Bug 1 fix — TCC preflight for external volumes:
+     * For any discovered prefix that lives on a removable/external volume,
+     * open the top-level directory once before any deeper glob/stat loops.
+     * This consolidates macOS's TCC permission prompt into a single dialog
+     * for the process instead of one per file access. */
+    for (int i = 0; i < count; i++) {
+        if (is_removable_volume(paths[i])) {
+            tcc_preflight_path(paths[i]);
+        }
+    }
+
     return count;
 }
 
@@ -1406,13 +1511,59 @@ static void steam_fallback_art_url(const char *steam_root, const char *appid,
     if (!appid || !out || out_len == 0) return;
     out[0] = '\0';
 
+    /* Bug 3 fix — High-quality image priority queue for Discord Rich Presence.
+     *
+     * Discord's large_image is displayed as a small square (~160×160 px), so
+     * resolution matters more than aspect ratio.  We try sources from highest
+     * to lowest quality, using the local Steam cache as a fast availability
+     * hint where possible, and a HEAD request for assets without a cache file.
+     *
+     * Priority:
+     *  1. library_600x900_2x.jpg — 2× capsule (1200×1800), best quality
+     *  2. logo.png               — transparent logo, crisp on dark background
+     *  3. library_hero.jpg       — hero art, typically 1920×620, very sharp
+     *  4. library_600x900.jpg    — standard capsule (600×900)
+     *  5. capsule_616x353.jpg    — horizontal capsule header
+     *  6. header.jpg             — final safe fallback
+     */
+
+    char url[512];
+
+    /* 1 — 2× capsule: if the local cache has the 1× version the 2× is almost
+     *     certainly on the CDN too (Valve always uploads both together). */
     if (steam_cache_asset_exists(steam_root, appid, "library_600x900.jpg")) {
+        snprintf(url, sizeof(url),
+                 "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/library_600x900_2x.jpg",
+                 appid);
+        /* Verify the 2x file actually exists on the CDN; fall through if not. */
+        if (steam_cdn_url_exists(url)) {
+            snprintf(out, out_len, "%s", url);
+            return;
+        }
+        /* 2x not available — use the 1x we already know exists. */
         snprintf(out, out_len,
                  "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/library_600x900.jpg",
                  appid);
         return;
     }
 
+    /* 2 — Transparent logo PNG (no reliable local cache indicator; use HEAD). */
+    snprintf(url, sizeof(url),
+             "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/logo.png", appid);
+    if (steam_cdn_url_exists(url)) {
+        snprintf(out, out_len, "%s", url);
+        return;
+    }
+
+    /* 3 — Hero art (no local cache indicator; use HEAD). */
+    snprintf(url, sizeof(url),
+             "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/library_hero.jpg", appid);
+    if (steam_cdn_url_exists(url)) {
+        snprintf(out, out_len, "%s", url);
+        return;
+    }
+
+    /* 4 — Horizontal capsule header (local cache check). */
     if (steam_cache_asset_exists(steam_root, appid, "header.jpg")) {
         snprintf(out, out_len,
                  "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/capsule_616x353.jpg",
@@ -1420,8 +1571,10 @@ static void steam_fallback_art_url(const char *steam_root, const char *appid,
         return;
     }
 
+    /* 5 — Icon hash from local appcache (original behaviour, kept as fallback). */
     if (steam_app_icon_url(steam_root, appid, out, out_len)) return;
 
+    /* 6 — Ultimate safe fallback. */
     snprintf(out, out_len,
              "https://cdn.cloudflare.steamstatic.com/steam/apps/%s/header.jpg",
              appid);
@@ -1438,11 +1591,42 @@ static int collect_steam_activity_for_prefix(const char *prefix,
     char steam_root[PATH_MAX];
     if (!steam_root_for_prefix(prefix, steam_root, sizeof(steam_root))) return 0;
 
+    /* Bug 1 fix: if the steam_root is on a removable volume, preflight it
+     * before opening any files to consolidate TCC dialogs. */
+    if (is_removable_volume(steam_root)) tcc_preflight_path(steam_root);
+
     char log_path[PATH_MAX];
     snprintf(log_path, sizeof(log_path), "%s/logs/streaming_log.txt", steam_root);
+
+    /* Bug 2 fix — Incremental log reading:
+     * Retrieve (or create) the persistent state for this prefix so we only
+     * process new log lines on each poll cycle. */
+    SteamLogState *ls = log_state_for_prefix(prefix);
+
+    struct stat st;
+    bool file_rotated = false;
+    if (stat(log_path, &st) == 0) {
+        if (ls && st.st_size < ls->file_size) {
+            /* File was truncated or rotated — start fresh. */
+            file_rotated = true;
+            ls->offset = 0;
+            ls->file_size = 0;
+        }
+    }
+
     FILE *f = fopen(log_path, "r");
     if (!f) return 0;
     if (saw_log) *saw_log = true;
+
+    /* If we have a valid saved offset and the file was not rotated, seek to it
+     * so we only process lines that are genuinely new since the last poll. */
+    if (ls && ls->offset > 0 && !file_rotated) {
+        if (fseek(f, ls->offset, SEEK_SET) != 0) {
+            /* Seek failed — fall back to reading from the start. */
+            rewind(f);
+            if (ls) { ls->offset = 0; ls->file_size = 0; }
+        }
+    }
 
     int count = 0;
     char line[2048];
@@ -1463,6 +1647,14 @@ static int collect_steam_activity_for_prefix(const char *prefix,
             if (slot >= 0) games[slot].process_count = 0;
         }
     }
+
+    /* Persist the current end-of-file position for the next poll cycle. */
+    if (ls) {
+        long pos = ftell(f);
+        if (pos >= 0) ls->offset = pos;
+        if (stat(log_path, &st) == 0) ls->file_size = (long)st.st_size;
+    }
+
     fclose(f);
     return count;
 }
@@ -1639,10 +1831,64 @@ static void *fallback_monitor_thread(void *arg) {
     time_t started_at = 0;
     time_t candidate_since = 0;
     time_t last_sent = 0;
+    /* Bug 2: track when we last saw a real log change and last checked Wine */
+    time_t last_wine_check = 0;
+    bool   last_wine_alive = false;
+    time_t activity_since  = 0; /* when has_game first became true for active_appid */
 
     for (;;) {
         SteamActivity game;
         bool has_game = !real_rpc_active() && find_active_steam_game(&cfg, &game);
+
+        /* Bug 2 fix — wineserver liveness guard:
+         * If the log says a game is running but no Wine process is alive,
+         * the log state is stale (leftover from a crashed/force-quit session).
+         * Check pgrep at most once per idle-timeout interval to limit overhead. */
+        if (has_game) {
+            time_t now_check = time(NULL);
+            if (now_check - last_wine_check >= WINECORD_FALLBACK_IDLE_SECONDS) {
+                last_wine_alive = is_wine_process_running();
+                last_wine_check = now_check;
+            }
+            if (!last_wine_alive) {
+                has_game = false;
+                fprintf(stdout,
+                        "Steam fallback: log shows game active but no Wine process found — "
+                        "treating as stale (AppID %s)\n", game.appid);
+                fflush(stdout);
+                /* Reset log state for this prefix so next read starts fresh */
+                SteamLogState *ls = log_state_for_prefix(game.prefix);
+                if (ls) { ls->offset = 0; ls->file_size = 0; }
+            }
+        }
+
+        /* Bug 2 fix — idle timeout guard:
+         * If we have been reporting a game as active for longer than the idle
+         * threshold with no new log events arriving (offset unchanged), assume
+         * the game has ended and the log simply never received the "game stopped"
+         * line. Force-clear the presence. */
+        if (has_game && active_appid[0] && strcmp(active_appid, game.appid) == 0) {
+            SteamLogState *ls = log_state_for_prefix(game.prefix);
+            if (ls && ls->offset == 0) {
+                /* Log state was reset between polls — treat as new session. */
+                activity_since = time(NULL);
+            } else {
+                time_t now_idle = time(NULL);
+                if (activity_since > 0 &&
+                    now_idle - activity_since > WINECORD_FALLBACK_IDLE_SECONDS &&
+                    last_sent > 0 &&
+                    now_idle - last_sent > WINECORD_FALLBACK_IDLE_SECONDS * 3) {
+                    /* No new log events in a very long time — force clear. */
+                    has_game = false;
+                    fprintf(stdout,
+                            "Steam fallback: no log activity for %ds — force-clearing "
+                            "presence for %s\n",
+                            WINECORD_FALLBACK_IDLE_SECONDS * 3,
+                            active_name[0] ? active_name : active_appid);
+                    fflush(stdout);
+                }
+            }
+        }
 
         if (!has_game) {
             if (discord_fd >= 0) {
@@ -1660,6 +1906,9 @@ static void *fallback_monitor_thread(void *arg) {
             started_at = 0;
             candidate_since = 0;
             last_sent = 0;
+            activity_since = 0;
+            last_wine_check = 0;
+            last_wine_alive = false;
             sleep(WINECORD_FALLBACK_POLL_SECONDS);
             continue;
         }
@@ -1680,6 +1929,7 @@ static void *fallback_monitor_thread(void *arg) {
             active_name[0] = '\0';
             started_at = 0;
             last_sent = 0;
+            activity_since = 0;
         }
 
         if (!active_appid[0] && now - candidate_since < WINECORD_FALLBACK_GRACE_SECONDS) {
@@ -1693,6 +1943,7 @@ static void *fallback_monitor_thread(void *arg) {
             snprintf(active_name, sizeof(active_name), "%s", game.name);
             started_at = now;
             last_sent = 0;
+            activity_since = now;
         }
 
         if (discord_fd < 0) discord_fd = open_fallback_discord();
@@ -1752,7 +2003,14 @@ static int doctor(const Config *cfg) {
         } else {
             find_wine_runner(cfg, bottle, NULL, runner, sizeof(runner));
         }
-        printf("    %s\n", bottle);
+        bool on_ext = is_removable_volume(bottle);
+        printf("    %s%s\n", bottle, on_ext ? " [external volume]" : "");
+        if (on_ext) {
+            printf("      note: prefix is on an external volume. macOS may show a\n");
+            printf("            Privacy > Files and Folders prompt the first time WineCord\n");
+            printf("            accesses it. To silence it permanently, grant Full Disk\n");
+            printf("            Access to the winecord binary in System Settings > Privacy.\n");
+        }
         printf("      runner: %s\n", runner[0] ? runner : "not found; pass --wine PATH");
         printf("      helper: %s\n", path_exists(helper) ? helper : "not installed");
     }
