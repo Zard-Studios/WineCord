@@ -31,7 +31,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.17"
+#define WINECORD_VERSION "0.1.18"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -96,6 +96,8 @@ typedef struct {
     char prefix[PATH_MAX];
     long offset;      /* byte offset of the next unread byte in the log */
     long file_size;   /* last known file size; if it shrinks, log was rotated */
+    SteamActivityCounter games[MAX_STEAM_ACTIVITY];
+    int game_count;
 } SteamLogState;
 
 #define MAX_LOG_STATES MAX_TRACKED_BOTTLES
@@ -160,6 +162,8 @@ static SteamLogState *log_state_for_prefix(const char *prefix) {
         snprintf(s->prefix, sizeof(s->prefix), "%s", prefix);
         s->offset = 0;
         s->file_size = 0;
+        s->game_count = 0;
+        memset(s->games, 0, sizeof(s->games));
         pthread_mutex_unlock(&g_log_state_lock);
         return s;
     }
@@ -1299,17 +1303,6 @@ static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int
     snprintf(pattern, sizeof(pattern), "%s/Wine Prefixes/*", home_dir());
     add_prefix_glob(paths, &count, pattern);
 
-    /* Bug 1 fix — TCC preflight for external volumes:
-     * For any discovered prefix that lives on a removable/external volume,
-     * open the top-level directory once before any deeper glob/stat loops.
-     * This consolidates macOS's TCC permission prompt into a single dialog
-     * for the process instead of one per file access. */
-    for (int i = 0; i < count; i++) {
-        if (is_removable_volume(paths[i])) {
-            tcc_preflight_path(paths[i]);
-        }
-    }
-
     return count;
 }
 
@@ -1580,16 +1573,17 @@ static void steam_fallback_art_url(const char *steam_root, const char *appid,
              appid);
 }
 
-static int collect_steam_activity_for_prefix(const char *prefix,
-                                             SteamActivityCounter games[],
-                                             int max_games,
-                                             bool *saw_log) {
+static void collect_steam_activity_for_prefix(const char *prefix,
+                                              SteamActivityCounter games[],
+                                              int *game_count_ptr,
+                                              int max_games,
+                                              bool *saw_log) {
     (void)max_games;
     if (saw_log) *saw_log = false;
-    if (!prefix || !games) return 0;
+    if (!prefix || !games || !game_count_ptr) return;
 
     char steam_root[PATH_MAX];
-    if (!steam_root_for_prefix(prefix, steam_root, sizeof(steam_root))) return 0;
+    if (!steam_root_for_prefix(prefix, steam_root, sizeof(steam_root))) return;
 
     /* Bug 1 fix: if the steam_root is on a removable volume, preflight it
      * before opening any files to consolidate TCC dialogs. */
@@ -1605,17 +1599,22 @@ static int collect_steam_activity_for_prefix(const char *prefix,
 
     struct stat st;
     bool file_rotated = false;
+    int count = *game_count_ptr;
+
     if (stat(log_path, &st) == 0) {
         if (ls && st.st_size < ls->file_size) {
             /* File was truncated or rotated — start fresh. */
             file_rotated = true;
             ls->offset = 0;
             ls->file_size = 0;
+            ls->game_count = 0;
+            memset(ls->games, 0, sizeof(ls->games));
+            count = 0;
         }
     }
 
     FILE *f = fopen(log_path, "r");
-    if (!f) return 0;
+    if (!f) return;
     if (saw_log) *saw_log = true;
 
     /* If we have a valid saved offset and the file was not rotated, seek to it
@@ -1624,11 +1623,16 @@ static int collect_steam_activity_for_prefix(const char *prefix,
         if (fseek(f, ls->offset, SEEK_SET) != 0) {
             /* Seek failed — fall back to reading from the start. */
             rewind(f);
-            if (ls) { ls->offset = 0; ls->file_size = 0; }
+            if (ls) {
+                ls->offset = 0;
+                ls->file_size = 0;
+                ls->game_count = 0;
+                memset(ls->games, 0, sizeof(ls->games));
+            }
+            count = 0;
         }
     }
 
-    int count = 0;
     char line[2048];
     while (fgets(line, sizeof(line), f)) {
         char appid[sizeof(games[0].appid)];
@@ -1656,7 +1660,7 @@ static int collect_steam_activity_for_prefix(const char *prefix,
     }
 
     fclose(f);
-    return count;
+    *game_count_ptr = count;
 }
 
 static int print_steam_activity_for_prefixes(char prefixes[][PATH_MAX], int prefix_count) {
@@ -1669,17 +1673,30 @@ static int print_steam_activity_for_prefixes(char prefixes[][PATH_MAX], int pref
     bool saw_any_log = false;
     int active_total = 0;
     for (int i = 0; i < prefix_count; i++) {
-        SteamActivityCounter games[MAX_STEAM_ACTIVITY];
-        memset(games, 0, sizeof(games));
+        SteamLogState *ls = log_state_for_prefix(prefixes[i]);
+        SteamActivityCounter *games;
+        int *game_count_ptr;
+        SteamActivityCounter local_games[MAX_STEAM_ACTIVITY];
+        int local_game_count = 0;
         bool saw_log = false;
-        int game_count = collect_steam_activity_for_prefix(prefixes[i], games,
-                                                          MAX_STEAM_ACTIVITY, &saw_log);
+
+        if (ls) {
+            games = ls->games;
+            game_count_ptr = &ls->game_count;
+        } else {
+            memset(local_games, 0, sizeof(local_games));
+            games = local_games;
+            game_count_ptr = &local_game_count;
+        }
+
+        collect_steam_activity_for_prefix(prefixes[i], games, game_count_ptr,
+                                           MAX_STEAM_ACTIVITY, &saw_log);
         saw_any_log = saw_any_log || saw_log;
         if (!saw_log) continue;
 
         char steam_root[PATH_MAX] = "";
         steam_root_for_prefix(prefixes[i], steam_root, sizeof(steam_root));
-        for (int j = 0; j < game_count; j++) {
+        for (int j = 0; j < *game_count_ptr; j++) {
             if (games[j].process_count <= 0) continue;
             char name[256] = "";
             steam_app_name(steam_root, games[j].appid, name, sizeof(name));
@@ -1718,16 +1735,29 @@ static bool find_active_steam_game(const Config *cfg, SteamActivity *out) {
     char prefixes[MAX_TRACKED_BOTTLES][PATH_MAX];
     int prefix_count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
     for (int i = 0; i < prefix_count; i++) {
-        SteamActivityCounter games[MAX_STEAM_ACTIVITY];
-        memset(games, 0, sizeof(games));
+        SteamLogState *ls = log_state_for_prefix(prefixes[i]);
+        SteamActivityCounter *games;
+        int *game_count_ptr;
+        SteamActivityCounter local_games[MAX_STEAM_ACTIVITY];
+        int local_game_count = 0;
         bool saw_log = false;
-        int game_count = collect_steam_activity_for_prefix(prefixes[i], games,
-                                                          MAX_STEAM_ACTIVITY, &saw_log);
+
+        if (ls) {
+            games = ls->games;
+            game_count_ptr = &ls->game_count;
+        } else {
+            memset(local_games, 0, sizeof(local_games));
+            games = local_games;
+            game_count_ptr = &local_game_count;
+        }
+
+        collect_steam_activity_for_prefix(prefixes[i], games, game_count_ptr,
+                                           MAX_STEAM_ACTIVITY, &saw_log);
         if (!saw_log) continue;
 
         char steam_root[PATH_MAX] = "";
         steam_root_for_prefix(prefixes[i], steam_root, sizeof(steam_root));
-        for (int j = 0; j < game_count; j++) {
+        for (int j = 0; j < *game_count_ptr; j++) {
             if (games[j].process_count <= 0) continue;
             snprintf(out->appid, sizeof(out->appid), "%s", games[j].appid);
             snprintf(out->prefix, sizeof(out->prefix), "%s", prefixes[i]);
@@ -1831,35 +1861,27 @@ static void *fallback_monitor_thread(void *arg) {
     time_t started_at = 0;
     time_t candidate_since = 0;
     time_t last_sent = 0;
-    /* Bug 2: track when we last saw a real log change and last checked Wine */
-    time_t last_wine_check = 0;
-    bool   last_wine_alive = false;
     time_t activity_since  = 0; /* when has_game first became true for active_appid */
 
     for (;;) {
         SteamActivity game;
-        bool has_game = !real_rpc_active() && find_active_steam_game(&cfg, &game);
+        bool wine_running = is_wine_process_running();
+        bool has_game = false;
+        if (wine_running && !real_rpc_active()) {
+            has_game = find_active_steam_game(&cfg, &game);
+        }
 
-        /* Bug 2 fix — wineserver liveness guard:
-         * If the log says a game is running but no Wine process is alive,
-         * the log state is stale (leftover from a crashed/force-quit session).
-         * Check pgrep at most once per idle-timeout interval to limit overhead. */
-        if (has_game) {
-            time_t now_check = time(NULL);
-            if (now_check - last_wine_check >= WINECORD_FALLBACK_IDLE_SECONDS) {
-                last_wine_alive = is_wine_process_running();
-                last_wine_check = now_check;
+        /* If we had a game active previously, but now no Wine process is running,
+         * we immediately reset the log state for all prefixes so next time they start fresh. */
+        if (!wine_running && active_appid[0]) {
+            pthread_mutex_lock(&g_log_state_lock);
+            for (int i = 0; i < g_log_state_count; i++) {
+                g_log_states[i].offset = 0;
+                g_log_states[i].file_size = 0;
+                g_log_states[i].game_count = 0;
+                memset(g_log_states[i].games, 0, sizeof(g_log_states[i].games));
             }
-            if (!last_wine_alive) {
-                has_game = false;
-                fprintf(stdout,
-                        "Steam fallback: log shows game active but no Wine process found — "
-                        "treating as stale (AppID %s)\n", game.appid);
-                fflush(stdout);
-                /* Reset log state for this prefix so next read starts fresh */
-                SteamLogState *ls = log_state_for_prefix(game.prefix);
-                if (ls) { ls->offset = 0; ls->file_size = 0; }
-            }
+            pthread_mutex_unlock(&g_log_state_lock);
         }
 
         /* Bug 2 fix — idle timeout guard:
@@ -1907,8 +1929,6 @@ static void *fallback_monitor_thread(void *arg) {
             candidate_since = 0;
             last_sent = 0;
             activity_since = 0;
-            last_wine_check = 0;
-            last_wine_alive = false;
             sleep(WINECORD_FALLBACK_POLL_SECONDS);
             continue;
         }
@@ -3229,9 +3249,16 @@ static int remove_bottle_setup(const Config *cfg, const char *bottle, const char
 static int setup_all(Config *cfg, int argc, char **argv) {
     print_header("Setting up WineCord");
     fflush(stdout);
-    if (install_agent(cfg) != 0) return 1;
-    if (install_bottle(cfg, argc, argv) != 0) return 1;
-    print_success("Done. Keep Discord for macOS open, then launch the Windows game from your Wine app.\n");
+    int agent_status = install_agent(cfg);
+    int bottle_status = install_bottle(cfg, argc, argv);
+    if (bottle_status != 0) return 1;
+    if (agent_status != 0) {
+        print_warning_stdout("Could not register the LaunchAgent with launchctl.\n");
+        print_warning_stdout("If you are running in an SSH or non-GUI session, this is expected.\n");
+        print_warning_stdout("Please run `winecord setup` again from a local terminal to enable background autostart.\n");
+    } else {
+        print_success("Done. Keep Discord for macOS open, then launch the Windows game from your Wine app.\n");
+    }
     return 0;
 }
 
