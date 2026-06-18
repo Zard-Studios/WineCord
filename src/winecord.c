@@ -31,7 +31,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.18"
+#define WINECORD_VERSION "0.1.19"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -1638,7 +1638,12 @@ static void collect_steam_activity_for_prefix(const char *prefix,
         char appid[sizeof(games[0].appid)];
         int slot = -1;
 
-        if (strstr(line, "Adding process") &&
+        if (strstr(line, "Client version")) {
+            /* Steam client restarted — clear all previous session state. */
+            for (int i = 0; i < count; i++) {
+                games[i].process_count = 0;
+            }
+        } else if (strstr(line, "Adding process") &&
             parse_gameid_after(line, "for gameID ", appid, sizeof(appid))) {
             slot = steam_activity_slot(games, &count, appid);
             if (slot >= 0) games[slot].process_count++;

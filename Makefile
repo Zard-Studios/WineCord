@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 BUILD_DIR ?= build
 DIST_DIR ?= dist
-VERSION ?= 0.1.18
+VERSION ?= 0.1.19
 
 CC ?= clang
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
