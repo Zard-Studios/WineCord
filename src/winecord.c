@@ -31,7 +31,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.19"
+#define WINECORD_VERSION "0.1.20"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -1259,6 +1259,25 @@ static void add_crossOver_prefixes(char paths[][PATH_MAX], int *count) {
     add_prefix_glob(paths, count, base);
 }
 
+/* Discovers Wineskin / Sikarugir-style .app wrappers.
+ * In these wrappers the WINEPREFIX is at MyGame.app/Contents/ (drive_c lives
+ * directly inside Contents/).  We glob for *.app bundles in the standard
+ * Sikarugir install folders and in the user/system Applications folder and
+ * add any Contents/ directory that passes is_wine_prefix(). */
+static void add_wineskin_prefixes(char paths[][PATH_MAX], int *count) {
+    char pattern[PATH_MAX];
+
+    /* Sikarugir stores wrappers under ~/Applications/Sikarugir/ */
+    snprintf(pattern, sizeof(pattern), "%s/Applications/Sikarugir/*.app/Contents", home_dir());
+    add_prefix_glob(paths, count, pattern);
+    add_prefix_glob(paths, count, "/Applications/Sikarugir/*.app/Contents");
+
+    /* Generic Wineskin wrappers anywhere in ~/Applications or /Applications */
+    snprintf(pattern, sizeof(pattern), "%s/Applications/*.app/Contents", home_dir());
+    add_prefix_glob(paths, count, pattern);
+    add_prefix_glob(paths, count, "/Applications/*.app/Contents");
+}
+
 static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int max_paths) {
     int count = 0;
     if (max_paths <= 0) return 0;
@@ -1278,6 +1297,7 @@ static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int
 
     add_crossOver_prefixes(paths, &count);
     add_whisky_cli_prefixes(paths, &count);
+    add_wineskin_prefixes(paths, &count);
 
     char pattern[PATH_MAX];
     snprintf(pattern, sizeof(pattern), "%s/Library/Containers/com.isaacmarovitz.Whisky/Bottles/*", home_dir());
@@ -2798,8 +2818,14 @@ static bool find_wine_runner(const Config *cfg, const char *prefix,
         return true;
     }
 
+    /* Detect any prefix that lives inside a .app bundle (handles Wineskin,
+     * Sikarugir, Porting Kit, and similar wrapper tools).  The prefix is
+     * typically at MyGame.app/Contents/ or a subdirectory thereof, so we
+     * look for the nearest ".app" component and search for the Wine binary
+     * relative to it. */
     const char *marker = strstr(prefix, ".app/Contents/SharedSupport/prefix");
     if (!marker) marker = strstr(prefix, ".app/Contents/Resources");
+    if (!marker) marker = strstr(prefix, ".app/Contents");  /* generic Wineskin/Sikarugir */
     if (marker) {
         char app[PATH_MAX];
         size_t app_len = (size_t)(marker - prefix) + strlen(".app");
@@ -2808,12 +2834,18 @@ static bool find_wine_runner(const Config *cfg, const char *prefix,
             app[app_len] = '\0';
 
             const char *formats[] = {
+                /* Wineskin / Sikarugir embedded engine */
+                "%s/Contents/Frameworks/wswine.bundle/bin/wine64",
+                "%s/Contents/Frameworks/wswine.bundle/bin/wine",
+                /* Other common embedded layouts */
                 "%s/Contents/Resources/wine/bin/wine64",
                 "%s/Contents/Resources/wine/bin/wine",
                 "%s/Contents/SharedSupport/wine/bin/wine64",
                 "%s/Contents/SharedSupport/wine/bin/wine",
-                "%s/Contents/Frameworks/wswine.bundle/bin/wine64",
-                "%s/Contents/Frameworks/wswine.bundle/bin/wine",
+                "%s/Contents/MacOS/wine64",
+                "%s/Contents/MacOS/wine",
+                "%s/Contents/wine/bin/wine64",
+                "%s/Contents/wine/bin/wine",
                 NULL
             };
             for (int i = 0; formats[i]; i++) {
@@ -2824,6 +2856,31 @@ static bool find_wine_runner(const Config *cfg, const char *prefix,
                 }
             }
         }
+    }
+
+    /* Sikarugir stores Wine engines centrally rather than embedding them
+     * inside each wrapper.  Check the known engine store locations. */
+    snprintf(candidate, sizeof(candidate),
+             "%s/Library/Application Support/Sikarugir/engines", home_dir());
+    if (is_directory(candidate)) {
+        char eng_pattern[PATH_MAX];
+        glob_t eg;
+        memset(&eg, 0, sizeof(eg));
+        snprintf(eng_pattern, sizeof(eng_pattern), "%s/*/bin/wine64", candidate);
+        if (glob(eng_pattern, 0, NULL, &eg) == 0 && eg.gl_pathc > 0) {
+            normalize_path_copy(out, out_len, eg.gl_pathv[0]);
+            globfree(&eg);
+            return true;
+        }
+        globfree(&eg);
+        snprintf(eng_pattern, sizeof(eng_pattern), "%s/*/bin/wine", candidate);
+        memset(&eg, 0, sizeof(eg));
+        if (glob(eng_pattern, 0, NULL, &eg) == 0 && eg.gl_pathc > 0) {
+            normalize_path_copy(out, out_len, eg.gl_pathv[0]);
+            globfree(&eg);
+            return true;
+        }
+        globfree(&eg);
     }
 
     if (command_path("wine64", out, out_len)) return true;
