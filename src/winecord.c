@@ -32,7 +32,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.21"
+#define WINECORD_VERSION "0.1.22"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477

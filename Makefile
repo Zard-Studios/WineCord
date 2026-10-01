@@ -1,11 +1,16 @@
 PREFIX ?= /usr/local
 BUILD_DIR ?= build
 DIST_DIR ?= dist
-VERSION ?= 0.1.21
+VERSION ?= 0.1.22
 
 CC ?= clang
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 LDFLAGS ?=
+
+# Release binaries are signed with a stable identity so macOS privacy grants
+# (e.g. removable volumes) survive upgrades. Skipped if the certificate is absent.
+SIGN_IDENTITY ?= WineCord Code Signing
+SIGN_ID ?= com.zardstudios.winecord
 
 WINDOWS_CC ?= x86_64-w64-mingw32-gcc
 WINDOWS_CFLAGS ?= -std=c11 -Wall -Wextra -O2
@@ -39,6 +44,12 @@ universal: $(UNIVERSAL)
 
 $(UNIVERSAL): $(BUILD_DIR)/arm64/winecord $(BUILD_DIR)/x86_64/winecord
 	lipo -create -output $@ $^
+	@if security find-certificate -c "$(SIGN_IDENTITY)" >/dev/null 2>&1; then \
+		echo "Signing with '$(SIGN_IDENTITY)'"; \
+		codesign --force -s "$(SIGN_IDENTITY)" -i "$(SIGN_ID)" $@; \
+	else \
+		echo "warning: '$(SIGN_IDENTITY)' not found; leaving ad-hoc signature"; \
+	fi
 
 windows-helper: $(WINDOWS_HELPER)
 
