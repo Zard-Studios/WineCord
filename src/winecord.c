@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -31,7 +32,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define WINECORD_VERSION "0.1.20"
+#define WINECORD_VERSION "0.1.21"
 #define WINECORD_LABEL "com.zardstudios.winecord.agent"
 #define WINECORD_FALLBACK_CLIENT_ID "1508914471433928824"
 #define WINECORD_DEFAULT_PORT 38477
@@ -43,7 +44,7 @@
 #define WINECORD_FALLBACK_POLL_SECONDS 5
 #define WINECORD_FALLBACK_GRACE_SECONDS 15
 #define WINECORD_FALLBACK_REFRESH_SECONDS 60
-#define WINECORD_FALLBACK_IDLE_SECONDS 30
+#define WINECORD_FALLBACK_MISSING_POLLS 3
 #define WINECORD_RPC_SUPPRESS_SECONDS 90
 #define WINECORD_UPDATE_CHECK_INTERVAL 86400
 #define WINECORD_FORMULA_URL "https://raw.githubusercontent.com/Zard-Studios/homebrew-tap/main/Formula/winecord.rb"
@@ -82,6 +83,7 @@ typedef struct {
 typedef struct {
     char appid[32];
     char name[256];
+    char installdir[256];
     char prefix[PATH_MAX];
     int process_count;
 } SteamActivity;
@@ -1426,13 +1428,13 @@ static bool read_vdf_value(const char *line, const char *key, char *out, size_t 
     return true;
 }
 
-static bool steam_app_name(const char *steam_root, const char *appid,
-                           char *out, size_t out_len) {
-    if (!steam_root || !appid || !out || out_len == 0) return false;
-    out[0] = '\0';
-
+static bool steam_manifest_value(const char *steamapps_dir, const char *appid,
+                                 const char *key, char *out, size_t out_len) {
     char manifest[PATH_MAX];
-    snprintf(manifest, sizeof(manifest), "%s/steamapps/appmanifest_%s.acf", steam_root, appid);
+    if (snprintf(manifest, sizeof(manifest), "%s/appmanifest_%s.acf",
+                 steamapps_dir, appid) >= (int)sizeof(manifest)) {
+        return false;
+    }
     FILE *f = fopen(manifest, "r");
     if (!f) return false;
 
@@ -1440,7 +1442,7 @@ static bool steam_app_name(const char *steam_root, const char *appid,
     bool found = false;
     while (fgets(line, sizeof(line), f)) {
         char name[256];
-        if (read_vdf_value(line, "name", name, sizeof(name))) {
+        if (read_vdf_value(line, key, name, sizeof(name))) {
             snprintf(out, out_len, "%s", name);
             found = true;
             break;
@@ -1448,6 +1450,128 @@ static bool steam_app_name(const char *steam_root, const char *appid,
     }
     fclose(f);
     return found;
+}
+
+/* Maps a Windows library path from libraryfolders.vdf (e.g. "D:\\\\Games\\\\Steam")
+ * to its location inside the Wine prefix. */
+static bool steam_library_host_path(const char *prefix, const char *win_path,
+                                    char *out, size_t out_len) {
+    if (!prefix || !*prefix || !win_path || !isalpha((unsigned char)win_path[0]) ||
+        win_path[1] != ':') {
+        return false;
+    }
+    char rest[PATH_MAX];
+    size_t n = 0;
+    for (const char *p = win_path + 2; *p && n + 1 < sizeof(rest); p++) {
+        if (*p == '\\') {
+            if (p[1] == '\\') p++;
+            rest[n++] = '/';
+        } else {
+            rest[n++] = *p;
+        }
+    }
+    rest[n] = '\0';
+
+    char drive = (char)tolower((unsigned char)win_path[0]);
+    int len = (drive == 'c')
+        ? snprintf(out, out_len, "%s/drive_c%s/steamapps", prefix, rest)
+        : snprintf(out, out_len, "%s/dosdevices/%c:%s/steamapps", prefix, drive, rest);
+    return len > 0 && (size_t)len < out_len;
+}
+
+/* Looks the app name up in the Steam Store API. Results (including misses)
+ * are cached for the lifetime of the process so polling never re-fetches. */
+static bool steam_store_api_name(const char *appid, char *out, size_t out_len) {
+    enum { CACHE_SIZE = 32 };
+    static struct { char appid[24]; char name[256]; } cache[CACHE_SIZE];
+    static int cache_count = 0;
+
+    for (int i = 0; i < cache_count; i++) {
+        if (strcmp(cache[i].appid, appid) == 0) {
+            if (!cache[i].name[0]) return false;
+            snprintf(out, out_len, "%s", cache[i].name);
+            return true;
+        }
+    }
+
+    for (const char *c = appid; *c; c++) {
+        if (!isdigit((unsigned char)*c)) return false;
+    }
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "/usr/bin/curl -fsS --connect-timeout 2 --max-time 4 "
+             "'https://store.steampowered.com/api/appdetails?appids=%s&filters=basic' "
+             "2>/dev/null", appid);
+    char name[256] = "";
+    FILE *p = popen(cmd, "r");
+    if (p) {
+        char body[8192];
+        size_t got = fread(body, 1, sizeof(body) - 1, p);
+        pclose(p);
+        body[got] = '\0';
+        const char *key = strstr(body, "\"name\":\"");
+        if (key) {
+            key += 8;
+            size_t n = 0;
+            while (*key && *key != '"' && n + 1 < sizeof(name)) {
+                if (*key == '\\' && key[1]) key++;
+                name[n++] = *key++;
+            }
+            name[n] = '\0';
+        }
+    }
+
+    if (cache_count < CACHE_SIZE) {
+        snprintf(cache[cache_count].appid, sizeof(cache[cache_count].appid), "%s", appid);
+        snprintf(cache[cache_count].name, sizeof(cache[cache_count].name), "%s", name);
+        cache_count++;
+    }
+    if (!name[0]) return false;
+    snprintf(out, out_len, "%s", name);
+    return true;
+}
+
+static bool steam_app_manifest_value(const char *steam_root, const char *appid,
+                                     const char *key, char *out, size_t out_len) {
+    if (!appid || !out || out_len == 0) return false;
+    out[0] = '\0';
+    if (!steam_root || !*steam_root) return false;
+
+    char steamapps[PATH_MAX];
+    snprintf(steamapps, sizeof(steamapps), "%s/steamapps", steam_root);
+    if (steam_manifest_value(steamapps, appid, key, out, out_len)) return true;
+
+    /* The game may live in an additional Steam library folder. */
+    char prefix[PATH_MAX];
+    snprintf(prefix, sizeof(prefix), "%s", steam_root);
+    char *drive_c = strstr(prefix, "/drive_c/");
+    if (!drive_c) return false;
+    *drive_c = '\0';
+
+    char vdf_path[PATH_MAX];
+    snprintf(vdf_path, sizeof(vdf_path), "%s/libraryfolders.vdf", steamapps);
+    FILE *f = fopen(vdf_path, "r");
+    if (!f) return false;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char lib[PATH_MAX], host[PATH_MAX];
+        if (!read_vdf_value(line, "path", lib, sizeof(lib))) continue;
+        if (!steam_library_host_path(prefix, lib, host, sizeof(host))) continue;
+        if (steam_manifest_value(host, appid, key, out, out_len)) {
+            fclose(f);
+            return true;
+        }
+    }
+    fclose(f);
+    return false;
+}
+
+static bool steam_app_name(const char *steam_root, const char *appid,
+                           char *out, size_t out_len) {
+    if (steam_app_manifest_value(steam_root, appid, "name", out, out_len)) return true;
+    if (!appid || !out || out_len == 0) return false;
+    return steam_store_api_name(appid, out, out_len);
 }
 
 static bool steam_cache_icon_hash(const char *filename, char *out, size_t out_len) {
@@ -1753,6 +1877,69 @@ static int steam_activity_command(const Config *cfg) {
     return 0;
 }
 
+/* ── Process liveness ──────────────────────────────────────────────────── */
+
+static bool contains_nocase(const char *hay, const char *needle) {
+    if (!hay || !needle || !*needle) return false;
+    size_t nlen = strlen(needle);
+    for (; *hay; hay++) {
+        if (strncasecmp(hay, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+/* Wine/Steam helper executables that keep running with no game open. */
+static bool is_wine_infrastructure_cmd(const char *cmd) {
+    static const char *const names[] = {
+        "steam.exe", "steamwebhelper", "steamservice", "steamerrorreporter",
+        "gameoverlayui", "services.exe", "winedevice", "explorer.exe",
+        "plugplay", "svchost", "rpcss", "conhost", "wineboot", "winemenubuilder",
+        "crashhandler", "tabtip", "start.exe", "cmd.exe", "wineserver",
+        "vcredist", "dxsetup", "dotnet", "installscript", NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        if (contains_nocase(cmd, names[i])) return true;
+    }
+    return false;
+}
+
+/* Checks the real process table for a running game, independent of Steam logs.
+ * Returns false only when it can be sure no game is running: Wine .exe command
+ * lines must be visible in `ps` (otherwise we cannot judge and keep trusting
+ * the logs) and none of them may belong to the game or be a non-helper exe. */
+static bool wine_game_process_alive(const char *installdir) {
+    FILE *p = popen("/bin/ps -axww -o command= 2>/dev/null", "r");
+    if (!p) return true;
+
+    bool saw_exe = false;
+    bool alive = false;
+    char line[4096];
+    while (fgets(line, sizeof(line), p)) {
+        if (!contains_nocase(line, ".exe")) continue;
+        saw_exe = true;
+        if ((installdir && *installdir && contains_nocase(line, installdir)) ||
+            !is_wine_infrastructure_cmd(line)) {
+            alive = true;
+        }
+    }
+    pclose(p);
+    return saw_exe ? alive : true;
+}
+
+/* Forget a game's process count so it only returns on a fresh "Adding process". */
+static void steam_activity_forget(const char *prefix, const char *appid) {
+    pthread_mutex_lock(&g_log_state_lock);
+    for (int i = 0; i < g_log_state_count; i++) {
+        if (strcmp(g_log_states[i].prefix, prefix) != 0) continue;
+        for (int j = 0; j < g_log_states[i].game_count; j++) {
+            if (strcmp(g_log_states[i].games[j].appid, appid) == 0) {
+                g_log_states[i].games[j].process_count = 0;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_log_state_lock);
+}
+
 static bool find_active_steam_game(const Config *cfg, SteamActivity *out) {
     if (!cfg || !out) return false;
     memset(out, 0, sizeof(*out));
@@ -1787,6 +1974,8 @@ static bool find_active_steam_game(const Config *cfg, SteamActivity *out) {
             snprintf(out->appid, sizeof(out->appid), "%s", games[j].appid);
             snprintf(out->prefix, sizeof(out->prefix), "%s", prefixes[i]);
             out->process_count = games[j].process_count;
+            steam_app_manifest_value(steam_root, games[j].appid, "installdir",
+                                     out->installdir, sizeof(out->installdir));
             if (!steam_app_name(steam_root, games[j].appid, out->name, sizeof(out->name))) {
                 snprintf(out->name, sizeof(out->name), "Steam app %s", games[j].appid);
             }
@@ -1886,7 +2075,7 @@ static void *fallback_monitor_thread(void *arg) {
     time_t started_at = 0;
     time_t candidate_since = 0;
     time_t last_sent = 0;
-    time_t activity_since  = 0; /* when has_game first became true for active_appid */
+    int missing_polls = 0;
 
     for (;;) {
         SteamActivity game;
@@ -1909,32 +2098,22 @@ static void *fallback_monitor_thread(void *arg) {
             pthread_mutex_unlock(&g_log_state_lock);
         }
 
-        /* Bug 2 fix — idle timeout guard:
-         * If we have been reporting a game as active for longer than the idle
-         * threshold with no new log events arriving (offset unchanged), assume
-         * the game has ended and the log simply never received the "game stopped"
-         * line. Force-clear the presence. */
-        if (has_game && active_appid[0] && strcmp(active_appid, game.appid) == 0) {
-            SteamLogState *ls = log_state_for_prefix(game.prefix);
-            if (ls && ls->offset == 0) {
-                /* Log state was reset between polls — treat as new session. */
-                activity_since = time(NULL);
-            } else {
-                time_t now_idle = time(NULL);
-                if (activity_since > 0 &&
-                    now_idle - activity_since > WINECORD_FALLBACK_IDLE_SECONDS &&
-                    last_sent > 0 &&
-                    now_idle - last_sent > WINECORD_FALLBACK_IDLE_SECONDS * 3) {
-                    /* No new log events in a very long time — force clear. */
-                    has_game = false;
-                    fprintf(stdout,
-                            "Steam fallback: no log activity for %ds — force-clearing "
-                            "presence for %s\n",
-                            WINECORD_FALLBACK_IDLE_SECONDS * 3,
-                            active_name[0] ? active_name : active_appid);
-                    fflush(stdout);
-                }
+        /* Liveness guard: the Steam log can miss the "game stopped" line (crash,
+         * kill, unknown launcher). Cross-check the real process table and, after
+         * a few consecutive polls without the game, drop the presence. */
+        if (has_game) {
+            if (wine_game_process_alive(game.installdir)) {
+                missing_polls = 0;
+            } else if (++missing_polls >= WINECORD_FALLBACK_MISSING_POLLS) {
+                fprintf(stdout, "Steam fallback: %s no longer running — clearing presence\n",
+                        game.name);
+                fflush(stdout);
+                steam_activity_forget(game.prefix, game.appid);
+                has_game = false;
+                missing_polls = 0;
             }
+        } else {
+            missing_polls = 0;
         }
 
         if (!has_game) {
@@ -1953,7 +2132,6 @@ static void *fallback_monitor_thread(void *arg) {
             started_at = 0;
             candidate_since = 0;
             last_sent = 0;
-            activity_since = 0;
             sleep(WINECORD_FALLBACK_POLL_SECONDS);
             continue;
         }
@@ -1974,7 +2152,6 @@ static void *fallback_monitor_thread(void *arg) {
             active_name[0] = '\0';
             started_at = 0;
             last_sent = 0;
-            activity_since = 0;
         }
 
         if (!active_appid[0] && now - candidate_since < WINECORD_FALLBACK_GRACE_SECONDS) {
@@ -1988,7 +2165,6 @@ static void *fallback_monitor_thread(void *arg) {
             snprintf(active_name, sizeof(active_name), "%s", game.name);
             started_at = now;
             last_sent = 0;
-            activity_since = now;
         }
 
         if (discord_fd < 0) discord_fd = open_fallback_discord();

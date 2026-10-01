@@ -2,7 +2,7 @@
 set -eu
 
 TAP_DIR="${1:-../homebrew-tap}"
-VERSION="${VERSION:-0.1.20}"
+VERSION="${VERSION:-0.1.21}"
 
 if [ ! -f "Formula/winecord.rb" ]; then
   echo "Run this from the WineCord repository root." >&2
