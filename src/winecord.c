@@ -1280,7 +1280,169 @@ static void add_wineskin_prefixes(char paths[][PATH_MAX], int *count) {
     add_prefix_glob(paths, count, "/Applications/*.app/Contents");
 }
 
-static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int max_paths) {
+/* ── NotProton (Steam Play for macOS) ─────────────────────────────────────
+ * NotProton runs Windows Steam games from the native macOS Steam client using a
+ * private, patched CrossOver copy in ~/Library/Application Support/notproton.
+ * Every game gets its own plain Wine prefix at
+ *   <Steam library>/steamapps/compatdata/<appid>/pfx
+ * (a WINEPREFIX, not a CrossOver bottle), so it needs its own runner handling.
+ * Everything below is additive: nothing happens unless NotProton is installed. */
+static bool is_steam_compat_prefix(const char *prefix) {
+    if (!prefix) return false;
+    size_t n = strlen(prefix);
+    return n > 4 && strcmp(prefix + n - 4, "/pfx") == 0 &&
+           strstr(prefix, "/steamapps/compatdata/") != NULL;
+}
+
+static bool is_notproton_runner_path(const char *path) {
+    return path_has_component(path, "/notproton/runners/crossover-");
+}
+
+static bool notproton_runners_dir(char *out, size_t out_len) {
+    if (snprintf(out, out_len, "%s/Library/Application Support/notproton/runners",
+                 home_dir()) >= (int)out_len) return false;
+    return is_directory(out);
+}
+
+/* Returns the CrossOver root NotProton used for this prefix (it records the
+ * build next to pfx in "notproton-build"), or else the newest installed one. */
+static bool notproton_runner_root_for_prefix(const char *prefix, char *out, size_t out_len) {
+    char runners[PATH_MAX];
+    if (!notproton_runners_dir(runners, sizeof(runners))) return false;
+
+    char parent[PATH_MAX];
+    char file[PATH_MAX];
+    if (prefix && parent_dir(prefix, parent, sizeof(parent)) == 0 &&
+        snprintf(file, sizeof(file), "%s/notproton-build", parent) < (int)sizeof(file)) {
+        FILE *f = fopen(file, "r");
+        if (f) {
+            char build[128] = "";
+            if (fgets(build, sizeof(build), f)) {
+                char *nl = strpbrk(build, "\r\n");
+                if (nl) *nl = '\0';
+                bool valid = build[0] != '\0';
+                for (const char *c = build; *c; c++) {
+                    if (!isdigit((unsigned char)*c) && *c != '.') valid = false;
+                }
+                char root[PATH_MAX];
+                if (valid && snprintf(root, sizeof(root), "%s/crossover-%s/CrossOver",
+                                      runners, build) < (int)sizeof(root) && is_directory(root)) {
+                    snprintf(out, out_len, "%s", root);
+                    fclose(f);
+                    return true;
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    char pattern[PATH_MAX];
+    if (snprintf(pattern, sizeof(pattern), "%s/crossover-*/CrossOver", runners) >= (int)sizeof(pattern)) return false;
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+    bool found = false;
+    if (glob(pattern, 0, NULL, &g) == 0) {
+        for (size_t i = g.gl_pathc; i > 0; i--) {
+            if (is_directory(g.gl_pathv[i - 1])) {
+                snprintf(out, out_len, "%s", g.gl_pathv[i - 1]);
+                found = true;
+                break;
+            }
+        }
+    }
+    globfree(&g);
+    return found;
+}
+
+/* True when the prefix's ntdll.dll is ARM64 (FEX); false for x86_64 (Rosetta). */
+static bool notproton_prefix_is_arm64(const char *prefix) {
+    char dll[PATH_MAX];
+    if (snprintf(dll, sizeof(dll), "%s/drive_c/windows/system32/ntdll.dll", prefix) >= (int)sizeof(dll)) return false;
+    FILE *f = fopen(dll, "rb");
+    if (!f) return false;
+    unsigned char b[4];
+    bool arm = false;
+    if (fseek(f, 60, SEEK_SET) == 0 && fread(b, 1, 4, f) == 4) {
+        long off = (long)b[0] | ((long)b[1] << 8) | ((long)b[2] << 16) | ((long)b[3] << 24);
+        unsigned char sig[6];
+        if (off > 0 && off < 4096 && fseek(f, off, SEEK_SET) == 0 && fread(sig, 1, 6, f) == 6 &&
+            sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0) {
+            arm = sig[4] == 0x64 && sig[5] == 0xaa;
+        }
+    }
+    fclose(f);
+    return arm;
+}
+
+static bool notproton_loader_for_prefix(const char *prefix, char *out, size_t out_len) {
+    char root[PATH_MAX];
+    if (!notproton_runner_root_for_prefix(prefix, root, sizeof(root))) return false;
+    char loader[PATH_MAX];
+    int n = notproton_prefix_is_arm64(prefix)
+        ? snprintf(loader, sizeof(loader), "%s/lib/wine/aarch64-unix/wine.app/Contents/MacOS/wine", root)
+        : snprintf(loader, sizeof(loader), "%s/lib/wine/x86_64-unix/wine", root);
+    if (n >= (int)sizeof(loader) || !path_exists(loader)) return false;
+    snprintf(out, out_len, "%s", loader);
+    return true;
+}
+
+/* Collects the "path" entries of Steam's libraryfolders.vdf. */
+static int steam_library_roots(char roots[][PATH_MAX], int max_roots) {
+    int count = 0;
+    char steam[PATH_MAX];
+    snprintf(steam, sizeof(steam), "%s/Library/Application Support/Steam", home_dir());
+    if (max_roots > 0) snprintf(roots[count++], PATH_MAX, "%s", steam);
+
+    char vdf[PATH_MAX];
+    if (snprintf(vdf, sizeof(vdf), "%s/steamapps/libraryfolders.vdf", steam) >= (int)sizeof(vdf)) return count;
+    FILE *f = fopen(vdf, "r");
+    if (!f) return count;
+    char line[PATH_MAX + 64];
+    while (fgets(line, sizeof(line), f) && count < max_roots) {
+        char *key = strstr(line, "\"path\"");
+        if (!key) continue;
+        char *q1 = strchr(key + 6, '"');
+        if (!q1) continue;
+        char *q2 = strchr(q1 + 1, '"');
+        if (!q2 || q2 == q1 + 1) continue;
+        *q2 = '\0';
+        if (q1[1] != '/') continue;
+        snprintf(roots[count++], PATH_MAX, "%s", q1 + 1);
+    }
+    fclose(f);
+    return count;
+}
+
+static void add_steam_compat_prefixes(char paths[][PATH_MAX], int *count) {
+    char runners[PATH_MAX];
+    if (!notproton_runners_dir(runners, sizeof(runners))) return;
+
+    char roots[MAX_TRACKED_BOTTLES][PATH_MAX];
+    int root_count = steam_library_roots(roots, MAX_TRACKED_BOTTLES);
+    for (int i = 0; i < root_count; i++) {
+        char pattern[PATH_MAX];
+        if (snprintf(pattern, sizeof(pattern), "%s/steamapps/compatdata/*/pfx", roots[i]) >= (int)sizeof(pattern)) continue;
+        /* Only prefixes Wine has already initialized (system.reg exists); never
+         * adopt an empty stub and let a Wine run populate it. */
+        glob_t g;
+        memset(&g, 0, sizeof(g));
+        if (glob(pattern, 0, NULL, &g) == 0) {
+            for (size_t k = 0; k < g.gl_pathc && *count < MAX_TRACKED_BOTTLES; k++) {
+                char reg[PATH_MAX];
+                if (snprintf(reg, sizeof(reg), "%s/system.reg", g.gl_pathv[k]) < (int)sizeof(reg) &&
+                    path_exists(reg)) {
+                    add_prefix_candidate(paths, count, g.gl_pathv[k]);
+                }
+            }
+        }
+        globfree(&g);
+    }
+}
+
+/* include_steam_compat adds NotProton's per-game Steam prefixes. It is only set by
+ * setup/status/uninstall, so the agent's periodic polling never scans Steam libraries. */
+static int discover_wine_prefixes_ex(const Config *cfg, char paths[][PATH_MAX], int max_paths,
+                                     bool include_steam_compat) {
     int count = 0;
     if (max_paths <= 0) return 0;
 
@@ -1325,7 +1487,13 @@ static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int
     snprintf(pattern, sizeof(pattern), "%s/Wine Prefixes/*", home_dir());
     add_prefix_glob(paths, &count, pattern);
 
+    if (include_steam_compat) add_steam_compat_prefixes(paths, &count);
+
     return count;
+}
+
+static int discover_wine_prefixes(const Config *cfg, char paths[][PATH_MAX], int max_paths) {
+    return discover_wine_prefixes_ex(cfg, paths, max_paths, false);
 }
 
 static void resolve_bottle(const Config *cfg, char *out, size_t out_len) {
@@ -1822,6 +1990,7 @@ static int print_steam_activity_for_prefixes(char prefixes[][PATH_MAX], int pref
     bool saw_any_log = false;
     int active_total = 0;
     for (int i = 0; i < prefix_count; i++) {
+        if (is_steam_compat_prefix(prefixes[i])) continue; /* NotProton: no Windows Steam logs */
         SteamLogState *ls = log_state_for_prefix(prefixes[i]);
         SteamActivityCounter *games;
         int *game_count_ptr;
@@ -2202,7 +2371,7 @@ static int doctor(const Config *cfg) {
     print_discord_sockets();
 
     char prefixes[MAX_TRACKED_BOTTLES][PATH_MAX];
-    int prefix_count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
+    int prefix_count = discover_wine_prefixes_ex(cfg, prefixes, MAX_TRACKED_BOTTLES, true);
     printf("\nWine:\n");
     printf("  CrossOver: %s\n", is_directory("/Applications/CrossOver.app") ? "/Applications/CrossOver.app" : "not found");
     printf("  Whisky:    %s\n", is_directory("/Applications/Whisky.app") ? "/Applications/Whisky.app" : "not found");
@@ -2950,6 +3119,13 @@ static bool find_wine_runner(const Config *cfg, const char *prefix,
     out[0] = '\0';
 
     const char *env_wine = getenv("WINECORD_WINE");
+
+    /* NotProton's per-game Steam prefixes must use NotProton's own CrossOver. */
+    if (is_steam_compat_prefix(prefix) && (!override_wine || !*override_wine) &&
+        (!env_wine || !*env_wine) && notproton_loader_for_prefix(prefix, out, out_len)) {
+        return true;
+    }
+
     const char *candidates[] = {
         override_wine,
         env_wine,
@@ -3219,6 +3395,76 @@ static int run_generic_wine_helper(const char *prefix, const char *wine,
     return 0;
 }
 
+/* Runs a helper inside a NotProton Steam prefix the way NotProton's own launcher does:
+ * plain WINEPREFIX mode with its private CrossOver loader (not CrossOver's --bottle CLI). */
+static int run_notproton_helper(const char *prefix, const char *wine,
+                                const char *helper_path, const char *helper_arg, bool quiet) {
+    char loader[PATH_MAX];
+    char root[PATH_MAX];
+    if (!notproton_runner_root_for_prefix(prefix, root, sizeof(root)) || !path_exists(wine)) {
+        if (!quiet) fprintf(stderr, "NotProton runner not found for prefix: %s\n", prefix);
+        return quiet ? 0 : 1;
+    }
+    /* Pick the loader matching the prefix architecture, like NotProton does. */
+    bool arm = notproton_prefix_is_arm64(prefix);
+    if (!notproton_loader_for_prefix(prefix, loader, sizeof(loader))) {
+        if (!quiet) fprintf(stderr, "NotProton Wine loader not found under %s\n", root);
+        return quiet ? 0 : 1;
+    }
+
+    char wine_unix[PATH_MAX];
+    char wineserver[PATH_MAX];
+    char dllpath[PATH_MAX * 2];
+    char bin[PATH_MAX];
+    snprintf(wine_unix, sizeof(wine_unix), "%s/lib/wine/%s", root, arm ? "aarch64-unix" : "x86_64-unix");
+    snprintf(bin, sizeof(bin), "%s/bin", root);
+    if (arm) {
+        snprintf(wineserver, sizeof(wineserver), "%s/bin/wineserver-arm64", root);
+    } else {
+        snprintf(wineserver, sizeof(wineserver), "%s/bin/wineserver", root);
+        if (!path_exists(wineserver)) snprintf(wineserver, sizeof(wineserver), "%s/bin/wineserver-x86", root);
+    }
+    snprintf(dllpath, sizeof(dllpath), "%s/lib/wine/x86_64-windows:%s", root, wine_unix);
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork failed: %s\n", strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        char d3d[PATH_MAX];
+        snprintf(d3d, sizeof(d3d), "%s/lib64/apple_gptk/external/libd3dshared.dylib", root);
+        if (path_exists(d3d)) setenv("CX_APPLEGPTK_LIBD3DSHARED_PATH", d3d, 1);
+
+        const char *old_path = getenv("PATH");
+        char new_path[PATH_MAX * 2];
+        snprintf(new_path, sizeof(new_path), "%s:%s", bin,
+                 old_path ? old_path : "/usr/bin:/bin:/usr/sbin:/sbin");
+        setenv("PATH", new_path, 1);
+        setenv("CX_ROOT", root, 1);
+        setenv("WINELOADER", loader, 1);
+        setenv("WINESERVER", wineserver, 1);
+        setenv("WINEDLLPATH", dllpath, 1);
+        setenv("WINEPREFIX", prefix, 1);
+        setenv("WINEDEBUG", "-all", 1);
+        execl(loader, "wine", helper_path, helper_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (!quiet) {
+            fprintf(stderr, "NotProton Wine command failed through prefix %s (status %d).\n", prefix, status);
+            fprintf(stderr, "Make sure no NotProton game is mid-launch, then run `winecord setup` again.\n");
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int run_prefix_helper(const Config *cfg, const char *prefix, const char *wine_override,
                              const char *helper_path, const char *helper_arg, bool quiet,
                              char *used_wine, size_t used_wine_len) {
@@ -3243,6 +3489,9 @@ static int run_prefix_helper(const Config *cfg, const char *prefix, const char *
         return 1;
     }
     if (used_wine && used_wine_len > 0) snprintf(used_wine, used_wine_len, "%s", wine);
+    if (is_steam_compat_prefix(prefix) && is_notproton_runner_path(wine)) {
+        return run_notproton_helper(prefix, wine, helper_path, helper_arg, quiet);
+    }
     if (is_crossover_runner(wine)) return run_crossover_helper(prefix, wine, helper_path, helper_arg, quiet);
     return run_generic_wine_helper(prefix, wine, helper_path, helper_arg, quiet);
 }
@@ -3329,7 +3578,8 @@ static int install_one_prefix(Config *cfg, const char *prefix, const char *helpe
     }
 
     remember_bottle(cfg, prefix);
-    if (used_wine[0] && path_exists(used_wine) && !is_crossover_runner(used_wine)) {
+    if (used_wine[0] && path_exists(used_wine) && !is_crossover_runner(used_wine) &&
+        !is_notproton_runner_path(used_wine)) {
         normalize_path_copy(cfg->wine_path, sizeof(cfg->wine_path), used_wine);
     }
     if (save_config(cfg) != 0) return 1;
@@ -3379,7 +3629,7 @@ static int install_bottle(Config *cfg, int argc, char **argv) {
             return 1;
         }
     } else {
-        prefix_count = discover_wine_prefixes(cfg, prefixes, MAX_TRACKED_BOTTLES);
+        prefix_count = discover_wine_prefixes_ex(cfg, prefixes, MAX_TRACKED_BOTTLES, true);
     }
 
     if (prefix_count == 0) {
@@ -3537,7 +3787,7 @@ static int uninstall_all(const Config *cfg, int argc, char **argv) {
 
             if (bottle_target_count == 0) {
                 char discovered[MAX_TRACKED_BOTTLES][PATH_MAX];
-                int discovered_count = discover_wine_prefixes(cfg, discovered, MAX_TRACKED_BOTTLES);
+                int discovered_count = discover_wine_prefixes_ex(cfg, discovered, MAX_TRACKED_BOTTLES, true);
                 for (int i = 0; i < discovered_count; i++) {
                     add_path_target(bottle_targets, &bottle_target_count, discovered[i]);
                 }
